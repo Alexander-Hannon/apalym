@@ -1,10 +1,21 @@
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import httpx
 
+
 app = FastAPI(title="Apalym API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "http://ai:8001")
 
