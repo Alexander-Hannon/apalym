@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File
 from pathlib import Path
+from pypdf import PdfReader
 
 import json
 import time
@@ -20,11 +21,16 @@ def log_json(**fields):
     }
     print(json.dumps(payload, ensure_ascii=False))
 
+
 STORAGE_DIR = Path("/app/storage")
 
 def get_tenant_id(request: Request) -> str:
     # For now: hardcoded. Later: from auth / workspace selection.
     return "demo-tenant"
+
+
+def get_doc_path(tenant_id: str, doc_id: str) -> Path:
+    return STORAGE_DIR / tenant_id / f"{doc_id}.pdf"
 
 
 
@@ -156,6 +162,45 @@ async def upload_doc(request: Request, file: UploadFile = File(...)):
         "doc_id": doc_id,
         "filename": file.filename,
         "size_bytes": size_bytes,
+    }
+
+
+
+@app.get("/v1/docs/{doc_id}/text")
+def get_doc_text(doc_id: str, request: Request):
+    request_id = request.state.request_id
+    tenant_id = get_tenant_id(request)
+
+    pdf_path = get_doc_path(tenant_id, doc_id)
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    reader = PdfReader(str(pdf_path))
+    parts = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+
+    text = "\n".join(parts)
+    preview = text[:1000]
+
+    log_json(
+        level="INFO",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        event="doc_text_extracted",
+        doc_id=doc_id,
+        chars=len(text),
+    )
+
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "doc_id": doc_id,
+        "chars": len(text),
+        "text_preview": preview,
     }
 
 
