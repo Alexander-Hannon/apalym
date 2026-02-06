@@ -50,8 +50,11 @@ def health():
 
 @app.post("/infer")
 def infer(payload: dict, request: Request):
+    tenant_id = request.headers.get("x-tenant-id", "unknown-tenant")
+
     return {
         "ok": True,
         "request_id": request.state.request_id,
+        "tenant_id": tenant_id,
         "echo": payload,
     }

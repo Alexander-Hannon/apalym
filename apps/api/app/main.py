@@ -71,15 +71,10 @@ def health():
 
 @app.post("/v1/demo")
 async def demo(req: DemoRequest, request: Request):
-    
-    """
-    Demo orchestration endpoint:
-    - receives a message from the web app
-    - calls the AI service (/infer)
-    - returns the AI response
-    """
-    
+     
     request_id = request.state.request_id
+    tenant_id = "demo-tenant"
+
     payload = {"message": req.message}
 
     try:
@@ -87,7 +82,10 @@ async def demo(req: DemoRequest, request: Request):
             r = await client.post(
                     f"{AI_BASE_URL}/infer", 
                     json=payload, 
-                    headers={"x-request-id": request_id} ,
+                    headers={
+                        "x-request-id": request_id,
+                        "x-tenant-id": tenant_id,
+                        } ,
                     )
 
             r.raise_for_status()
@@ -97,6 +95,7 @@ async def demo(req: DemoRequest, request: Request):
             "ok": True,
             "service": "api",
             "request_id": request_id,
+            "tenant_id": tenant_id,
             "sent_to_ai": payload,
             "ai_response": ai_data,
         }
