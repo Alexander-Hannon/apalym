@@ -27,6 +27,7 @@ services:
       - redis
     volumes:
       - ./apps/api:/app
+      - ./apps/api/storage:/app/storage
 
   ai:
     build:

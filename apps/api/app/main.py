@@ -3,6 +3,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import UploadFile, File
+from pathlib import Path
 
 import json
 import time
@@ -17,6 +19,13 @@ def log_json(**fields):
         **fields,
     }
     print(json.dumps(payload, ensure_ascii=False))
+
+STORAGE_DIR = Path("/app/storage")
+
+def get_tenant_id(request: Request) -> str:
+    # For now: hardcoded. Later: from auth / workspace selection.
+    return "demo-tenant"
+
 
 
 app = FastAPI(title="Apalym API")
@@ -77,33 +86,78 @@ async def demo(req: DemoRequest, request: Request):
 
     payload = {"message": req.message}
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(
-                    f"{AI_BASE_URL}/infer", 
-                    json=payload, 
-                    headers={
-                        "x-request-id": request_id,
-                        "x-tenant-id": tenant_id,
-                        } ,
-                    )
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+                f"{AI_BASE_URL}/infer", 
+                json=payload, 
+                headers={
+                    "x-request-id": request_id,
+                    "x-tenant-id": tenant_id,
+                    } ,
+        )
 
-            r.raise_for_status()
-            ai_data = r.json()
+        r.raise_for_status()
+        ai_data = r.json()
 
-        return {
-            "ok": True,
-            "service": "api",
-            "request_id": request_id,
-            "tenant_id": tenant_id,
-            "sent_to_ai": payload,
-            "ai_response": ai_data,
-        }
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "sent_to_ai": payload,
+        "ai_response": ai_data,
 
-    except httpx.ConnectError:
-        raise HTTPException(status_code=502, detail="Could not connect to AI service")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"AI error: {e.response.text}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    }
+
+
+
+@app.post("/v1/docs/upload")
+async def upload_doc(request: Request, file: UploadFile = File(...)):
+    request_id = request.state.request_id
+    tenant_id = get_tenant_id(request)
+
+    # Basic content-type check (not perfect, but good for MVP)
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported right now")
+
+    doc_id = str(uuid.uuid4())
+    tenant_dir = STORAGE_DIR / tenant_id
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+
+    dest_path = tenant_dir / f"{doc_id}.pdf"
+
+    # Stream file to disk (safe for larger files)
+    size_bytes = 0
+    with dest_path.open("wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)  # 1MB
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            f.write(chunk)
+
+    log_json(
+        level="INFO",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        event="doc_uploaded",
+        doc_id=doc_id,
+        filename=file.filename,
+        size_bytes=size_bytes,
+        stored_path=str(dest_path),
+    )
+
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "doc_id": doc_id,
+        "filename": file.filename,
+        "size_bytes": size_bytes,
+    }
+
+
+
 
