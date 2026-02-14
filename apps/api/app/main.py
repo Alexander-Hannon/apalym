@@ -14,6 +14,8 @@ import os
 import httpx
 
 
+# HELPERS
+
 def log_json(**fields):
     payload = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -33,6 +35,55 @@ def get_doc_path(tenant_id: str, doc_id: str) -> Path:
     return STORAGE_DIR / tenant_id / f"{doc_id}.pdf"
 
 
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100):
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be < chunk_size")
+
+    chunks = []
+    n = len(text)
+    start = 0
+    idx = 0
+
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunk_str = text[start:end]
+
+        # skip empty/whitespace chunks
+        if chunk_str.strip():
+            chunks.append({
+                "chunk_id": str(idx),
+                "start": start,
+                "end": end,
+                "text": chunk_str,
+            })
+            idx += 1
+
+        # move start forward with overlap
+        next_start = end - overlap
+
+        # Guarantee progress to avoid infinite loops
+        if next_start <= start:
+            next_start = end  # drop overlap if overlap would stall
+
+        start = next_start
+
+        # safety: if overlap math causes no progress, break
+        if start < 0:
+            start = 0
+        if start >= n:
+            break
+
+    return chunks
+
+
+
+
+#----------------------------------------
 
 app = FastAPI(title="Apalym API")
 
@@ -204,5 +255,56 @@ def get_doc_text(doc_id: str, request: Request):
     }
 
 
+@app.get("/v1/docs/{doc_id}/chunks")
+def get_doc_chunks(
+    doc_id: str,
+    request: Request,
+    chunk_size: int = 800,
+    overlap: int = 100,
+    limit: int = 200,
+):
+    request_id = request.state.request_id
+    tenant_id = get_tenant_id(request)
+
+    pdf_path = get_doc_path(tenant_id, doc_id)
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Extract text (same pattern as /text)
+    reader = PdfReader(str(pdf_path))
+    parts = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    text = "\n".join(parts)
+
+    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+
+    # Limit chunk count for safety (avoid huge payloads)
+    chunks = chunks[:max(0, limit)]
+
+    log_json(
+        level="INFO",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        event="doc_chunked",
+        doc_id=doc_id,
+        chars=len(text),
+        chunk_size=chunk_size,
+        overlap=overlap,
+        num_chunks=len(chunks),
+    )
+
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "doc_id": doc_id,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "num_chunks": len(chunks),
+        "chunks": chunks,
+    }
 
 
