@@ -6,12 +6,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File
 from pathlib import Path
 from pypdf import PdfReader
+from google import genai
+from pinecone.grpc import PineconeGRPC as Pinecone
 
 import json
 import time
 import uuid
 import os
 import httpx
+import math
 
 
 # HELPERS
@@ -80,6 +83,30 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100):
 
     return chunks
 
+def l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0:
+        return vec
+    return [x / norm for x in vec]
+
+
+def get_gemini_client() -> genai.Client:
+    # google-genai can read GEMINI_API_KEY from env automatically,
+    # but we’ll validate it exists so failures are obvious.
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    return genai.Client()
+
+def get_pinecone_index():
+    api_key = os.getenv("PINECONE_API_KEY")
+    host = os.getenv("PINECONE_HOST")
+    if not api_key:
+        raise RuntimeError("Missing PINECONE_API_KEY")
+    if not host:
+        raise RuntimeError("Missing PINECONE_HOST")
+
+    pc = Pinecone(api_key=api_key)
+    return pc.Index(host=host)
 
 
 
@@ -307,4 +334,120 @@ def get_doc_chunks(
         "chunks": chunks,
     }
 
+
+@app.post("/v1/docs/{doc_id}/index")
+def index_document(
+    doc_id: str,
+    request: Request,
+    chunk_size: int = 800,
+    overlap: int = 100,
+    limit: int = 500,
+    batch_size: int = 50,
+    embed_dim: int = 768,
+):
+    """
+    Index a document:
+    - extract text from stored PDF
+    - chunk with overlap
+    - embed chunks with Gemini
+    - upsert vectors into Pinecone under tenant namespace
+    """
+    request_id = request.state.request_id
+    tenant_id = get_tenant_id(request)
+
+    # 1) Load PDF
+    pdf_path = get_doc_path(tenant_id, doc_id)
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 2) Extract text (same approach as /text)
+    reader = PdfReader(str(pdf_path))
+    parts = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    text = "\n".join(parts).strip()
+
+    if not text:
+        return {
+            "ok": True,
+            "service": "api",
+            "request_id": request_id,
+            "tenant_id": tenant_id,
+            "doc_id": doc_id,
+            "num_chunks": 0,
+            "upserted_count": 0,
+        }
+
+    # 3) Chunk
+    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)[:max(0, limit)]
+    chunk_texts = [c["text"] for c in chunks]
+
+    # 4) Embed (Gemini)
+    gemini = get_gemini_client()
+
+    # Gemini supports embedding multiple strings at once via contents=[...] :contentReference[oaicite:4]{index=4}
+    all_vectors: list[list[float]] = []
+    for i in range(0, len(chunk_texts), batch_size):
+        batch = chunk_texts[i:i + batch_size]
+        result = gemini.models.embed_content(
+            model="gemini-embedding-001",
+            contents=batch,
+            # keep vector size consistent for Pinecone index
+            config={"output_dimensionality": embed_dim},
+        )
+        # result.embeddings should align 1:1 with contents
+        # Each embedding object contains "values" (list[float]) in the SDK.
+        # We’ll support both common shapes safely.
+        for emb in result.embeddings:
+            vec = getattr(emb, "values", None) or emb.get("values")
+            all_vectors.append(l2_normalize(vec))
+
+    # 5) Build Pinecone vectors
+    vectors = []
+    for c, vec in zip(chunks, all_vectors):
+        vectors.append({
+            "id": f"{doc_id}:{c['chunk_id']}",
+            "values": vec,
+            "metadata": {
+                "tenant_id": tenant_id,
+                "doc_id": doc_id,
+                "chunk_id": c["chunk_id"],
+                "start": c["start"],
+                "end": c["end"],
+                # MVP choice: store chunk text in metadata for easy retrieval.
+                # Later we may store only pointers to reduce metadata size.
+                "text": c["text"],
+            },
+        })
+
+    # 6) Upsert to Pinecone namespace=tenant_id :contentReference[oaicite:5]{index=5}
+    index = get_pinecone_index()
+    upserted_total = 0
+    for i in range(0, len(vectors), 100):  # Pinecone recommends batching; 100 is safe
+        resp = index.upsert(vectors=vectors[i:i + 100], namespace=tenant_id)
+        # resp is usually dict-like with upsertedCount
+        upserted_total += getattr(resp, "upserted_count", None) or resp.get("upsertedCount", 0)
+
+    log_json(
+        level="INFO",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        event="doc_indexed",
+        doc_id=doc_id,
+        num_chunks=len(chunks),
+        embed_dim=embed_dim,
+        upserted_count=upserted_total,
+    )
+
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "doc_id": doc_id,
+        "num_chunks": len(chunks),
+        "embed_dim": embed_dim,
+        "upserted_count": upserted_total,
+    }
 
