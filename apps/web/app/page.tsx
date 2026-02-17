@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { postJson } from "./lib/api";
 
 type DemoResponse = {
   ok: boolean;
@@ -21,28 +22,24 @@ export default function Home() {
     setData(null);
 
     try {
-      const res = await fetch("http://localhost:8000/v1/demo", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`API error ${res.status}: ${text}`);
-      }
-
-      const json = (await res.json()) as DemoResponse;
+      const json = await postJson<DemoResponse>("/v1/demo", { message });
       setData(json);
     } catch (e: any) {
       setError(e?.message ?? "Unknown error");
     } finally {
       setLoading(false);
     }
-  }
+  } // ✅ closes runDemo
 
   return (
-    <main style={{ maxWidth: 800, margin: "40px auto", padding: 16, fontFamily: "system-ui, sans-serif" }}>
+    <main
+      style={{
+        maxWidth: 800,
+        margin: "40px auto",
+        padding: 16,
+        fontFamily: "system-ui, sans-serif",
+      }}
+    >
       <h1 style={{ fontSize: 28, marginBottom: 8 }}>Apalym Demo</h1>
       <p style={{ marginTop: 0, color: "#555" }}>
         Click the button to run a web → api → ai call and display the response.
@@ -72,7 +69,15 @@ export default function Home() {
       </div>
 
       {error && (
-        <div style={{ marginTop: 16, padding: 12, borderRadius: 8, background: "#ffe6e6", border: "1px solid #ffb3b3" }}>
+        <div
+          style={{
+            marginTop: 16,
+            padding: 12,
+            borderRadius: 8,
+            background: "#ffe6e6",
+            border: "1px solid #ffb3b3",
+          }}
+        >
           <strong>Error:</strong> {error}
         </div>
       )}
