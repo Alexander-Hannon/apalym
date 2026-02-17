@@ -759,6 +759,7 @@ def ask(req: AskRequest, request: Request):
         "tenant_id": tenant_id,
         "query": req.query,
         "answer": answer,
+        "answer_mode": "rag",
         "citations": citations,
         "matches": matches,  # keep for debugging/UI “sources panel”
     }
