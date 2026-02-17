@@ -1,13 +1,14 @@
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File
 from pathlib import Path
 from pypdf import PdfReader
 from google import genai
 from pinecone.grpc import PineconeGRPC as Pinecone
+from typing import Optional, Any
 
 import json
 import time
@@ -155,6 +156,12 @@ AI_BASE_URL = os.getenv("AI_BASE_URL", "http://ai:8001")
 
 class DemoRequest(BaseModel):
     message: str
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    top_k: int = Field(5, ge=1, le=20)
+    doc_id: Optional[str] = None  # optional filter to a specific doc
+
 
 
 @app.get("/health")
@@ -449,5 +456,100 @@ def index_document(
         "num_chunks": len(chunks),
         "embed_dim": embed_dim,
         "upserted_count": upserted_total,
+    }
+
+
+@app.post("/v1/search")
+def search(req: SearchRequest, request: Request):
+    request_id = request.state.request_id
+    tenant_id = get_tenant_id(request)
+
+    query_text = req.query.strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # 1) Embed the query with Gemini (must match the SAME dim as your indexed vectors)
+    embed_dim = 768
+    gemini = get_gemini_client()
+    result = gemini.models.embed_content(
+        model="gemini-embedding-001",
+        contents=[query_text],
+        config={"output_dimensionality": embed_dim},
+    )
+
+    emb0 = result.embeddings[0]
+    qvec = getattr(emb0, "values", None)
+    if qvec is None and isinstance(emb0, dict):
+        qvec = emb0.get("values")
+    if qvec is None:
+        raise RuntimeError(f"Unexpected embedding shape: {type(emb0)}")
+
+    qvec = l2_normalize(qvec)
+
+    # 2) Query Pinecone in tenant namespace
+    index = get_pinecone_index()
+
+    # Optional filter: restrict to a specific doc_id
+    pinecone_filter = None
+    if req.doc_id:
+        pinecone_filter = {"doc_id": {"$eq": req.doc_id}}
+
+    res = index.query(
+        vector=qvec,
+        top_k=req.top_k,
+        namespace=tenant_id,
+        include_metadata=True,
+        filter=pinecone_filter,
+    )
+
+    # 3) Normalize response into a clean payload
+    matches = []
+    raw_matches = getattr(res, "matches", None) or res.get("matches", [])
+    for m in raw_matches:
+        mid = getattr(m, "id", None) or m.get("id")
+        score = getattr(m, "score", None) or m.get("score")
+        md = getattr(m, "metadata", None) or m.get("metadata", {}) or {}
+
+        # "citation" is the minimal info we need to reference the source chunk
+        citation = {
+            "source_id": mid,
+            "doc_id": md.get("doc_id"),
+            "chunk_id": md.get("chunk_id"),
+            "start": md.get("start"),
+            "end": md.get("end"),
+        }
+
+        matches.append({
+            "id": mid,
+            "score": score,
+            "text": md.get("text", ""),
+            "metadata": {
+                "doc_id": md.get("doc_id"),
+                "chunk_id": md.get("chunk_id"),
+                "start": md.get("start"),
+                "end": md.get("end"),
+            },
+            "citation": citation,
+        })
+
+    log_json(
+        level="INFO",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        event="search",
+        top_k=req.top_k,
+        doc_id=req.doc_id,
+        num_matches=len(matches),
+    )
+
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "query": req.query,
+        "top_k": req.top_k,
+        "matches": matches,
     }
 
