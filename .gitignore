@@ -30,3 +30,12 @@ venv/
 
 # Docker
 **/.docker-data/
+
+
+# Logs
+logs
+*.log
+
+# IDE
+.vscode/
+.idea/
