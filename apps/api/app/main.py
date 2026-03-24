@@ -34,7 +34,9 @@ STORAGE_DIR = Path("/app/storage")
 
 def get_tenant_id(request: Request) -> str:
     # For now: hardcoded. Later: from auth / workspace selection.
-    return "demo-tenant"
+    tenant_id = "demo-tenant"
+    request.state.tenant_id = tenant_id
+    return tenant_id
 
 
 def get_doc_path(tenant_id: str, doc_id: str) -> Path:
@@ -111,12 +113,19 @@ def get_pinecone_index():
     pc = Pinecone(api_key=api_key)
     return pc.Index(host=host)
 
-def retrieve_matches(tenant_id: str, query_text: str, top_k: int, doc_id: Optional[str] = None):
+def retrieve_matches(
+    tenant_id: str,
+    query_text: str,
+    top_k: int,
+    doc_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+):
     embed_dim = 768
+    embed_model = "gemini-embedding-001"
 
     gemini = get_gemini_client()
     result = gemini.models.embed_content(
-        model="gemini-embedding-001",
+        model=embed_model,
         contents=[query_text],
         config={"output_dimensionality": embed_dim},
     )
@@ -146,10 +155,14 @@ def retrieve_matches(tenant_id: str, query_text: str, top_k: int, doc_id: Option
 
     raw_matches = getattr(res, "matches", None) or res.get("matches", [])
     matches = []
+    retrieved_doc_ids: set[str] = set()
     for m in raw_matches:
         mid = getattr(m, "id", None) or m.get("id")
         score = getattr(m, "score", None) or m.get("score")
         md = getattr(m, "metadata", None) or m.get("metadata", {}) or {}
+
+        if md.get("doc_id"):
+            retrieved_doc_ids.add(md["doc_id"])
 
         citation = {
             "source_id": mid,
@@ -172,6 +185,20 @@ def retrieve_matches(tenant_id: str, query_text: str, top_k: int, doc_id: Option
             },
             "citation": citation,
         })
+
+    log_json(
+        level="INFO",
+        event="retrieval",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        embedding_model=embed_model,
+        embed_dim=embed_dim,
+        top_k=top_k,
+        retrieved_k=len(matches),
+        retrieved_doc_ids=sorted(retrieved_doc_ids) if retrieved_doc_ids else None,
+        doc_id_filter=doc_id,
+    )
 
     return matches
 
@@ -209,6 +236,8 @@ async def request_logging_middleware(request: Request, call_next):
 
     # Store on request.state so handlers can access it
     request.state.request_id = request_id
+    request.state.tenant_id = None
+    request.state.user_id = None
 
     try:
         response: Response = await call_next(request)
@@ -218,10 +247,19 @@ async def request_logging_middleware(request: Request, call_next):
     finally:
         latency_ms = int((time.time() - start) * 1000)
 
+        route_pattern = None
+        route_obj = request.scope.get("route")
+        if route_obj is not None:
+            route_pattern = getattr(route_obj, "path", None)
+
         log_json(
             level="INFO",
+            event="request_complete",
             service="api",
             request_id=request_id,
+            tenant_id=getattr(request.state, "tenant_id", None),
+            user_id=getattr(request.state, "user_id", None),
+            route=route_pattern,
             method=request.method,
             path=request.url.path,
             status_code=locals().get("status_code", 500),
@@ -251,6 +289,7 @@ async def demo(req: DemoRequest, request: Request):
      
     request_id = request.state.request_id
     tenant_id = "demo-tenant"
+    request.state.tenant_id = tenant_id
 
     payload = {"message": req.message}
 
@@ -306,14 +345,14 @@ async def upload_doc(request: Request, file: UploadFile = File(...)):
 
     log_json(
         level="INFO",
+        event="doc_uploaded",
         service="api",
         request_id=request_id,
         tenant_id=tenant_id,
-        event="doc_uploaded",
+        user_id=None,
         doc_id=doc_id,
         filename=file.filename,
         size_bytes=size_bytes,
-        stored_path=str(dest_path),
     )
 
     return {
@@ -347,10 +386,11 @@ def get_doc_text(doc_id: str, request: Request):
 
     log_json(
         level="INFO",
+        event="doc_text_extracted",
         service="api",
         request_id=request_id,
         tenant_id=tenant_id,
-        event="doc_text_extracted",
+        user_id=None,
         doc_id=doc_id,
         chars=len(text),
     )
@@ -395,10 +435,11 @@ def get_doc_chunks(
 
     log_json(
         level="INFO",
+        event="doc_chunked",
         service="api",
         request_id=request_id,
         tenant_id=tenant_id,
-        event="doc_chunked",
+        user_id=None,
         doc_id=doc_id,
         chars=len(text),
         chunk_size=chunk_size,
@@ -514,12 +555,14 @@ def index_document(
 
     log_json(
         level="INFO",
+        event="doc_indexed",
         service="api",
         request_id=request_id,
         tenant_id=tenant_id,
-        event="doc_indexed",
+        user_id=None,
         doc_id=doc_id,
         num_chunks=len(chunks),
+        embedding_model="gemini-embedding-001",
         embed_dim=embed_dim,
         upserted_count=upserted_total,
     )
@@ -581,11 +624,15 @@ def search(req: SearchRequest, request: Request):
 
     # 3) Normalize response into a clean payload
     matches = []
+    retrieved_doc_ids: set[str] = set()
     raw_matches = getattr(res, "matches", None) or res.get("matches", [])
     for m in raw_matches:
         mid = getattr(m, "id", None) or m.get("id")
         score = getattr(m, "score", None) or m.get("score")
         md = getattr(m, "metadata", None) or m.get("metadata", {}) or {}
+
+        if md.get("doc_id"):
+            retrieved_doc_ids.add(md["doc_id"])
 
         # "citation" is the minimal info we need to reference the source chunk
         citation = {
@@ -611,13 +658,15 @@ def search(req: SearchRequest, request: Request):
 
     log_json(
         level="INFO",
+        event="search",
         service="api",
         request_id=request_id,
         tenant_id=tenant_id,
-        event="search",
+        embedding_model="gemini-embedding-001",
         top_k=req.top_k,
-        doc_id=req.doc_id,
-        num_matches=len(matches),
+        retrieved_k=len(matches),
+        retrieved_doc_ids=sorted(retrieved_doc_ids) if retrieved_doc_ids else None,
+        doc_id_filter=req.doc_id,
     )
 
     return {
@@ -642,7 +691,7 @@ def ask(req: AskRequest, request: Request):
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     # 1) Retrieve top chunks
-    matches = retrieve_matches(tenant_id, query_text, req.top_k, req.doc_id)
+    matches = retrieve_matches(tenant_id, query_text, req.top_k, req.doc_id, request_id=request_id)
 
     if not matches:
         return {
@@ -694,18 +743,22 @@ def ask(req: AskRequest, request: Request):
             contents=full_prompt,
         )
     except genai_errors.ClientError as e:
-        # Quota / billing / rate limit / invalid model, etc.
         msg = str(e)
         log_json(
             level="ERROR",
+            event="llm_call_failed",
             service="api",
             request_id=request_id,
             tenant_id=tenant_id,
-            event="ask_failed",
+            user_id=None,
+            llm_provider="google",
+            llm_model=model_name,
             error="GENAI_CLIENT_ERROR",
             detail=msg[:500],
+            retrieved_k=len(matches),
+            token_usage=None,
         )
-            # Extractive fallback: answer from sources without generation
+        # Extractive fallback: answer from sources without generation
         top = matches[:3]
         bullets = []
         for m in top:
@@ -741,15 +794,37 @@ def ask(req: AskRequest, request: Request):
     if not answer:
         answer = "I couldn't generate an answer from the provided excerpts."
 
+    # Extract token usage if the SDK exposes it
+    usage_metadata = getattr(resp, "usage_metadata", None)
+    token_usage = None
+    if usage_metadata is not None:
+        token_usage = {
+            "prompt_tokens": getattr(usage_metadata, "prompt_token_count", None),
+            "candidates_tokens": getattr(usage_metadata, "candidates_token_count", None),
+            "total_tokens": getattr(usage_metadata, "total_token_count", None),
+        }
+
+    retrieved_doc_ids: set[str] = set()
+    for m in matches:
+        d = (m.get("metadata") or {}).get("doc_id")
+        if d:
+            retrieved_doc_ids.add(d)
+
     log_json(
         level="INFO",
+        event="llm_call",
         service="api",
         request_id=request_id,
         tenant_id=tenant_id,
-        event="ask",
+        user_id=None,
+        llm_provider="google",
+        llm_model=model_name,
+        answer_mode="rag",
+        retrieved_k=len(matches),
+        retrieved_doc_ids=sorted(retrieved_doc_ids) if retrieved_doc_ids else None,
         top_k=req.top_k,
-        doc_id=req.doc_id,
-        num_matches=len(matches),
+        doc_id_filter=req.doc_id,
+        token_usage=token_usage,
     )
 
     return {
