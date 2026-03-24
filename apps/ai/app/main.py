@@ -32,10 +32,21 @@ async def request_logging_middleware(request: Request, call_next):
     finally:
         latency_ms = int((time.time() - start) * 1000)
 
+        tenant_id = request.headers.get("x-tenant-id")
+
+        route_pattern = None
+        route_obj = request.scope.get("route")
+        if route_obj is not None:
+            route_pattern = getattr(route_obj, "path", None)
+
         log_json(
             level="INFO",
+            event="request_complete",
             service="ai",
             request_id=request_id,
+            tenant_id=tenant_id,
+            user_id=None,
+            route=route_pattern,
             method=request.method,
             path=request.url.path,
             status_code=locals().get("status_code", 500),

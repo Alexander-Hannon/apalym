@@ -31,6 +31,11 @@ venv/
 # Docker
 **/.docker-data/
 
+# Storage / uploads / tenant data
+apps/api/storage/
+uploads/
+tmp/
+*.pdf
 
 # Logs
 logs
