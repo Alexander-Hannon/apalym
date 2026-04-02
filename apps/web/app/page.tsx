@@ -260,6 +260,16 @@ export default function Home() {
           {!indexed && <p className="helper-note">Upload and index a PDF to enable Ask.</p>}
 
           <div className="answer-panel">
+            <div className="response-module-header">
+              <h3>Response</h3>
+              <span className={`response-state ${hasAssistantAnswer ? "ready" : "idle"}`}>
+                {hasAssistantAnswer ? "Grounded answer" : "Waiting for question"}
+              </span>
+            </div>
+            <p className="response-copy">
+              Answers are generated from indexed chunks and paired with scored source references.
+            </p>
+
             {chat.length === 0 ? (
               <div className="empty-state">
                 Your conversation appears here after you ask a question.
@@ -278,17 +288,20 @@ export default function Home() {
           {citations.length > 0 && (
             <div className="sources-block">
               <h3>Sources ({citations.length})</h3>
-              <p className="sources-copy">Expand a source to review its confidence and text span.</p>
+              <p className="sources-copy">Expand a source to inspect confidence score and character span.</p>
 
               <div className="sources-list">
                 {citations.map((citation) => (
                   <details key={citation.source_id} className="source-card">
                     <summary>
-                      <span className="source-id">
-                        {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
-                      </span>
-                      <span className="source-meta">
-                        score {citation.score.toFixed(3)} | chars {citation.start}-{citation.end}
+                      <div className="source-summary-main">
+                        <span className="source-id">
+                          {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
+                        </span>
+                        <span className="source-score">score {citation.score.toFixed(3)}</span>
+                      </div>
+                      <span className="source-range">
+                        chars {citation.start}-{citation.end}
                       </span>
                     </summary>
                     <div className="source-note">
