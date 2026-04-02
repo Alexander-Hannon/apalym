@@ -43,8 +43,19 @@ type AskResp = {
   message?: string;
 };
 
+type ChatMessage = { role: "user" | "assistant"; text: string };
+
 function makeRequestId() {
   return `WEB-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function asErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+function statusClassName(state: "idle" | "ready" | "working" | "complete") {
+  return `status-chip status-${state}`;
 }
 
 export default function Home() {
@@ -58,7 +69,7 @@ export default function Home() {
   const [indexed, setIndexed] = useState<IndexResp | null>(null);
 
   const [query, setQuery] = useState("What does being dialed in mean?");
-  const [chat, setChat] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
+  const [chat, setChat] = useState<ChatMessage[]>([]);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [busy, setBusy] = useState<null | "upload" | "ask">(null);
   const [err, setErr] = useState<string | null>(null);
@@ -70,6 +81,10 @@ export default function Home() {
     }),
     [requestId, tenantId]
   );
+
+  const canUpload = Boolean(file) && busy === null;
+  const canAsk = Boolean(indexed) && busy === null;
+  const hasAssistantAnswer = chat.some((entry) => entry.role === "assistant");
 
   async function uploadAndIndex() {
     if (!file) return;
@@ -94,8 +109,8 @@ export default function Home() {
       )) as IndexResp;
 
       setIndexed(idx);
-    } catch (e: any) {
-      setErr(e?.message ?? "Upload/index failed");
+    } catch (e: unknown) {
+      setErr(asErrorMessage(e, "Upload/index failed"));
     } finally {
       setBusy(null);
     }
@@ -120,157 +135,178 @@ export default function Home() {
 
       setChat((c) => [...c, { role: "assistant", text: resp.answer ?? "" }]);
       setCitations(resp.citations ?? []);
-    } catch (e: any) {
-      setErr(e?.message ?? "Ask failed");
+    } catch (e: unknown) {
+      setErr(asErrorMessage(e, "Ask failed"));
     } finally {
       setBusy(null);
     }
   }
 
+  const uploadStatus =
+    busy === "upload"
+      ? { label: "Processing", tone: "working" as const }
+      : indexed
+        ? { label: "Indexed", tone: "complete" as const }
+        : file
+          ? { label: "Ready", tone: "ready" as const }
+          : { label: "Awaiting file", tone: "idle" as const };
+
+  const askStatus =
+    busy === "ask"
+      ? { label: "Generating answer", tone: "working" as const }
+      : hasAssistantAnswer
+        ? { label: "Answered", tone: "complete" as const }
+        : indexed
+          ? { label: "Ready", tone: "ready" as const }
+          : { label: "Upload first", tone: "idle" as const };
+
   return (
-    <main style={{ maxWidth: 980, margin: "0 auto", padding: 24 }}>
-      <header style={{ padding: "28px 0 18px" }}>
-        <h1 style={{ fontSize: 34, letterSpacing: -0.5, margin: 0 }}>Apalym</h1>
-        <p style={{ margin: "10px 0 0", color: "var(--muted)", maxWidth: 760 }}>
-          Upload a PDF, then ask questions. Answers come back with citations so you can trust what you’re seeing.
+    <main className="demo-shell">
+      <header className="hero-block">
+        <p className="hero-kicker">Product Demo</p>
+        <h1>Apalym</h1>
+        <p className="hero-subtitle">
+          Upload a PDF, ask a question, and verify every answer with scored source citations.
         </p>
 
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 14 }}>
-          <span style={pillStyle}>tenant: {tenantId}</span>
-          <span style={pillStyle}>request_id: {requestId}</span>
-          <button
-            onClick={() => setRequestId(makeRequestId())}
-            style={{ ...btnStyle, marginLeft: "auto" }}
-          >
-            New request id
+        <div className="meta-strip">
+          <span className="meta-pill">
+            <span className="meta-pill-label">tenant</span>
+            <code>{tenantId}</code>
+          </span>
+          <span className="meta-pill">
+            <span className="meta-pill-label">request_id</span>
+            <code>{requestId}</code>
+          </span>
+          <button onClick={() => setRequestId(makeRequestId())} className="secondary-btn meta-refresh-btn">
+            New request ID
           </button>
         </div>
       </header>
 
-      <div style={{ display: "grid", gridTemplateColumns: "380px 1fr", gap: 18 }}>
-        {/* Left card: Upload */}
-        <section style={cardStyle}>
-          <h2 style={h2Style}>Upload</h2>
-          <p style={mutedStyle}>Choose a PDF. We’ll index it automatically (no settings required).</p>
-
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-
-          <button
-            onClick={uploadAndIndex}
-            disabled={!file || busy !== null}
-            style={{
-              ...primaryBtnStyle,
-              opacity: !file || busy ? 0.6 : 1,
-              marginTop: 12,
-            }}
-          >
-            {busy === "upload" ? "Uploading & indexing…" : "Upload PDF"}
-          </button>
-
-          <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 14 }}>
-            <div style={metaRowStyle}>
-              <span style={metaKeyStyle}>Document</span>
-              <span style={metaValStyle}>{doc?.filename ?? "—"}</span>
+      <div className="workflow-grid">
+        <section className="surface-card">
+          <div className="section-heading">
+            <div>
+              <p className="step-kicker">Step 1</p>
+              <h2>Upload document</h2>
             </div>
-            <div style={metaRowStyle}>
-              <span style={metaKeyStyle}>doc_id</span>
-              <span style={metaValStyle}>{doc?.doc_id ?? "—"}</span>
-            </div>
-            <div style={metaRowStyle}>
-              <span style={metaKeyStyle}>Indexed</span>
-              <span style={metaValStyle}>{indexed ? `${indexed.upserted_count} chunks` : "—"}</span>
-            </div>
+            <span className={statusClassName(uploadStatus.tone)}>{uploadStatus.label}</span>
           </div>
 
-          {err && (
-            <div style={errorStyle}>
-              <strong>Problem:</strong> {err}
-            </div>
+          <p className="section-copy">
+            Choose a PDF. We apply stable indexing defaults automatically, with no setup required.
+          </p>
+
+          <label className="file-input-wrap">
+            <span className="file-input-label">PDF file</span>
+            <input
+              className="file-input"
+              type="file"
+              accept="application/pdf"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            />
+          </label>
+
+          {file && (
+            <p className="selected-file">
+              Selected: <strong>{file.name}</strong>
+            </p>
           )}
+
+          <button onClick={uploadAndIndex} disabled={!canUpload} className="primary-btn full-width">
+            {busy === "upload" ? "Uploading and indexing..." : "Upload PDF"}
+          </button>
+
+          <div className="meta-table">
+            <div className="meta-row">
+              <span className="meta-key">Document</span>
+              <span className="meta-value">{doc?.filename ?? "--"}</span>
+            </div>
+            <div className="meta-row">
+              <span className="meta-key">doc_id</span>
+              <span className="meta-value">{doc?.doc_id ?? "--"}</span>
+            </div>
+            <div className="meta-row">
+              <span className="meta-key">Indexed chunks</span>
+              <span className="meta-value">{indexed ? `${indexed.upserted_count}` : "--"}</span>
+            </div>
+          </div>
         </section>
 
-        {/* Right card: Ask + chat */}
-        <section style={cardStyle}>
-          <h2 style={h2Style}>Ask</h2>
+        <section className="surface-card">
+          <div className="section-heading">
+            <div>
+              <p className="step-kicker">Step 2</p>
+              <h2>Ask and review answer</h2>
+            </div>
+            <span className={statusClassName(askStatus.tone)}>{askStatus.label}</span>
+          </div>
 
-          <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+          <p className="section-copy">Ask a question grounded in the uploaded document.</p>
+
+          <div className="ask-row">
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask a question about your PDF…"
-              style={inputStyle}
+              placeholder="Ask a question about your PDF..."
+              className="query-input"
             />
-            <button
-              onClick={ask}
-              disabled={busy !== null}
-              style={{ ...primaryBtnStyle, width: 120, opacity: busy ? 0.6 : 1 }}
-            >
-              {busy === "ask" ? "Asking…" : "Ask"}
+            <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
+              {busy === "ask" ? "Asking..." : "Ask"}
             </button>
           </div>
 
-          <div style={{ marginTop: 16 }}>
+          {!indexed && <p className="helper-note">Upload and index a PDF to enable Ask.</p>}
+
+          <div className="answer-panel">
+            <div className="response-module-header">
+              <h3>Response</h3>
+              <span className={`response-state ${hasAssistantAnswer ? "ready" : "idle"}`}>
+                {hasAssistantAnswer ? "Grounded answer" : "Waiting for question"}
+              </span>
+            </div>
+            <p className="response-copy">
+              Answers are generated from indexed chunks and paired with scored source references.
+            </p>
+
             {chat.length === 0 ? (
-              <div style={{ ...mutedStyle, padding: "14px 2px" }}>
-                Upload a PDF, then ask a question to see an answer with sources.
+              <div className="empty-state">
+                Your conversation appears here after you ask a question.
               </div>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {chat.map((m, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-                      maxWidth: "92%",
-                      padding: "12px 14px",
-                      borderRadius: 14,
-                      background: m.role === "user" ? "rgba(109,94,252,.12)" : "rgba(15,18,34,.04)",
-                      border: "1px solid var(--border)",
-                      lineHeight: 1.45,
-                      whiteSpace: "pre-wrap",
-                    }}
-                  >
-                    {m.text}
+              <div className="chat-thread">
+                {chat.map((message, i) => (
+                  <div key={i} className={`chat-bubble ${message.role}`}>
+                    {message.text}
                   </div>
                 ))}
               </div>
             )}
           </div>
 
-          {/* Citations */}
           {citations.length > 0 && (
-            <div style={{ marginTop: 18 }}>
-              <h3 style={{ margin: "0 0 10px", fontSize: 14, color: "var(--muted)" }}>Sources</h3>
+            <div className="sources-block">
+              <h3>Sources ({citations.length})</h3>
+              <p className="sources-copy">Expand a source to inspect confidence score and character span.</p>
 
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {citations.map((c) => (
-                  <details key={c.source_id} style={sourceCardStyle}>
-                    <summary
-                      style={{
-                        cursor: "pointer",
-                        display: "flex",
-                        gap: 10,
-                        alignItems: "center",
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                          fontSize: 12,
-                        }}
-                      >
-                        {c.doc_id.slice(0, 8)}…:{c.chunk_id}
-                      </span>
-                      <span style={{ color: "var(--muted)", fontSize: 12 }}>
-                        score {c.score.toFixed(3)} • chars {c.start}-{c.end}
+              <div className="sources-list">
+                {citations.map((citation) => (
+                  <details key={citation.source_id} className="source-card">
+                    <summary>
+                      <div className="source-summary-main">
+                        <span className="source-id">
+                          {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
+                        </span>
+                        <span className="source-score">score {citation.score.toFixed(3)}</span>
+                      </div>
+                      <span className="source-range">
+                        chars {citation.start}-{citation.end}
                       </span>
                     </summary>
-                    <div style={{ marginTop: 10, color: "var(--muted)", fontSize: 13 }}>
-                      (Next enhancement: “View excerpt” by fetching doc text and slicing start/end.)
+                    <div className="source-note">
+                      Snippet preview is a follow-up enhancement. This source confirms which chunk grounded the
+                      answer.
                     </div>
                   </details>
                 ))}
@@ -279,98 +315,12 @@ export default function Home() {
           )}
         </section>
       </div>
+
+      {err && (
+        <div className="error-banner">
+          <strong>Problem:</strong> {err}
+        </div>
+      )}
     </main>
   );
 }
-
-const cardStyle: React.CSSProperties = {
-  background: "var(--card)",
-  border: "1px solid var(--border)",
-  borderRadius: 18,
-  padding: 18,
-  boxShadow: "var(--shadow)",
-  minWidth: 0,
-};
-
-const h2Style: React.CSSProperties = { margin: 0, fontSize: 16, letterSpacing: -0.2 };
-
-const mutedStyle: React.CSSProperties = { margin: "10px 0 0", color: "var(--muted)", fontSize: 13 };
-
-const pillStyle: React.CSSProperties = {
-  padding: "7px 10px",
-  borderRadius: 999,
-  border: "1px solid var(--border)",
-  background: "rgba(255,255,255,.7)",
-  fontSize: 12,
-  color: "var(--muted)",
-};
-
-const btnStyle: React.CSSProperties = {
-  padding: "9px 12px",
-  borderRadius: 12,
-  border: "1px solid var(--border)",
-  background: "rgba(255,255,255,.9)",
-  cursor: "pointer",
-  fontSize: 13,
-};
-
-const primaryBtnStyle: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 12,
-  border: "1px solid rgba(109,94,252,.35)",
-  background: "linear-gradient(180deg, rgba(109,94,252,.95), rgba(109,94,252,.82))",
-  color: "white",
-  cursor: "pointer",
-  fontWeight: 600,
-};
-
-const inputStyle: React.CSSProperties = {
-  flex: 1,
-  padding: "12px 14px",
-  borderRadius: 14,
-  border: "1px solid var(--border)",
-  outline: "none",
-  minWidth: 0,
-  fontSize: 16,
-  fontWeight: 600,
-  background: "rgba(255,255,255,.95)",
-  boxShadow: "0 10px 30px rgba(17, 12, 46, 0.06)",
-};
-
-
-const metaRowStyle: React.CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  gap: 12,
-  padding: "6px 0",
-};
-
-const metaKeyStyle: React.CSSProperties = { color: "var(--muted)", fontSize: 12 };
-
-const metaValStyle: React.CSSProperties = {
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-  fontSize: 12,
-  color: "var(--text)",
-  overflow: "hidden",
-  textOverflow: "ellipsis",
-  whiteSpace: "nowrap",
-  maxWidth: 240,
-};
-
-const errorStyle: React.CSSProperties = {
-  marginTop: 14,
-  padding: 12,
-  borderRadius: 14,
-  border: "1px solid rgba(255, 90, 90, .25)",
-  background: "rgba(255, 90, 90, .07)",
-  color: "#7b1b1b",
-  fontSize: 13,
-};
-
-const sourceCardStyle: React.CSSProperties = {
-  border: "1px solid var(--border)",
-  borderRadius: 14,
-  padding: "10px 12px",
-  background: "rgba(15,18,34,.02)",
-};
-
