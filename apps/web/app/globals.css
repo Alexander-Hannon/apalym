@@ -208,6 +208,18 @@ code {
   border: 1px dashed rgba(147, 158, 203, 0.5);
   background: rgba(17, 22, 38, 0.9);
   color: var(--text);
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+
+.file-input:hover {
+  border-color: rgba(164, 175, 228, 0.65);
+}
+
+.file-input:focus {
+  outline: none;
+  border-color: rgba(147, 126, 255, 0.7);
+  background: rgba(20, 26, 45, 0.96);
+  box-shadow: 0 0 0 3px rgba(123, 97, 255, 0.24);
 }
 
 .selected-file {
