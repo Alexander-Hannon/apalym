@@ -199,7 +199,7 @@ export default function Home() {
           </p>
 
           <label className="file-input-wrap">
-            <span className="file-input-label">PDF file</span>
+            <span className="file-input-label">Document file (PDF or CSV)</span>
             <input
               className="file-input"
               type="file"
