@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import csv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -31,6 +32,7 @@ def log_json(**fields):
 
 
 STORAGE_DIR = Path("/app/storage")
+SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv")
 
 def get_tenant_id(request: Request) -> str:
     # For now: hardcoded. Later: from auth / workspace selection.
@@ -40,7 +42,77 @@ def get_tenant_id(request: Request) -> str:
 
 
 def get_doc_path(tenant_id: str, doc_id: str) -> Path:
-    return STORAGE_DIR / tenant_id / f"{doc_id}.pdf"
+    tenant_dir = STORAGE_DIR / tenant_id
+    for ext in SUPPORTED_DOC_EXTENSIONS:
+        candidate = tenant_dir / f"{doc_id}.{ext}"
+        if candidate.exists():
+            return candidate
+    return tenant_dir / f"{doc_id}.pdf"
+
+
+def infer_doc_extension(filename: str | None, content_type: str | None) -> str:
+    filename_lower = (filename or "").lower()
+    content_type_lower = (content_type or "").lower()
+
+    if filename_lower.endswith(".csv") or content_type_lower in ("text/csv", "application/csv"):
+        return "csv"
+
+    if filename_lower.endswith(".pdf") or content_type_lower in ("application/pdf", "application/octet-stream"):
+        return "pdf"
+
+    raise HTTPException(status_code=400, detail="Only PDF and CSV uploads are supported")
+
+
+def extract_pdf_text(doc_path: Path) -> str:
+    reader = PdfReader(str(doc_path))
+    parts = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    return "\n".join(parts)
+
+
+def extract_csv_text(doc_path: Path) -> str:
+    with doc_path.open("r", encoding="utf-8-sig", newline="", errors="replace") as f:
+        reader = csv.DictReader(f)
+
+        if not reader.fieldnames:
+            return ""
+
+        header_pairs: list[tuple[str, str]] = []
+        for idx, source_header in enumerate(reader.fieldnames, start=1):
+            source_key = source_header or ""
+            cleaned = source_key.strip()
+            label = cleaned if cleaned else f"column_{idx}"
+            header_pairs.append((source_key, label))
+
+        sections = [f"CSV columns: {', '.join(label for _, label in header_pairs)}"]
+
+        for row_index, raw_row in enumerate(reader, start=1):
+            row_lines = []
+            for source_key, label in header_pairs:
+                value = (raw_row.get(source_key) or "").strip()
+                if value:
+                    row_lines.append(f"{label}: {value}")
+
+            extra_cells = raw_row.get(None) or []
+            for extra_index, value in enumerate(extra_cells, start=1):
+                cleaned = (value or "").strip()
+                if cleaned:
+                    row_lines.append(f"extra_column_{extra_index}: {cleaned}")
+
+            if row_lines:
+                sections.append(f"Row {row_index}:\n" + "\n".join(row_lines))
+
+        return "\n\n".join(sections)
+
+
+def extract_doc_text(doc_path: Path) -> str:
+    suffix = doc_path.suffix.lower()
+    if suffix == ".pdf":
+        return extract_pdf_text(doc_path)
+    if suffix == ".csv":
+        return extract_csv_text(doc_path)
+    raise HTTPException(status_code=400, detail="Unsupported stored document type")
 
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100):
@@ -323,15 +395,13 @@ async def upload_doc(request: Request, file: UploadFile = File(...)):
     request_id = request.state.request_id
     tenant_id = get_tenant_id(request)
 
-    # Basic content-type check (not perfect, but good for MVP)
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Only PDF uploads are supported right now")
+    doc_ext = infer_doc_extension(file.filename, file.content_type)
 
     doc_id = str(uuid.uuid4())
     tenant_dir = STORAGE_DIR / tenant_id
     tenant_dir.mkdir(parents=True, exist_ok=True)
 
-    dest_path = tenant_dir / f"{doc_id}.pdf"
+    dest_path = tenant_dir / f"{doc_id}.{doc_ext}"
 
     # Stream file to disk (safe for larger files)
     size_bytes = 0
@@ -352,6 +422,7 @@ async def upload_doc(request: Request, file: UploadFile = File(...)):
         user_id=None,
         doc_id=doc_id,
         filename=file.filename,
+        doc_type=doc_ext,
         size_bytes=size_bytes,
     )
 
@@ -362,6 +433,7 @@ async def upload_doc(request: Request, file: UploadFile = File(...)):
         "tenant_id": tenant_id,
         "doc_id": doc_id,
         "filename": file.filename,
+        "doc_type": doc_ext,
         "size_bytes": size_bytes,
     }
 
@@ -372,16 +444,11 @@ def get_doc_text(doc_id: str, request: Request):
     request_id = request.state.request_id
     tenant_id = get_tenant_id(request)
 
-    pdf_path = get_doc_path(tenant_id, doc_id)
-    if not pdf_path.exists():
+    doc_path = get_doc_path(tenant_id, doc_id)
+    if not doc_path.exists():
         raise HTTPException(status_code=404, detail="Document not found")
 
-    reader = PdfReader(str(pdf_path))
-    parts = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-
-    text = "\n".join(parts)
+    text = extract_doc_text(doc_path)
     preview = text[:1000]
 
     log_json(
@@ -392,6 +459,7 @@ def get_doc_text(doc_id: str, request: Request):
         tenant_id=tenant_id,
         user_id=None,
         doc_id=doc_id,
+        doc_type=doc_path.suffix.lower().lstrip("."),
         chars=len(text),
     )
 
@@ -401,6 +469,7 @@ def get_doc_text(doc_id: str, request: Request):
         "request_id": request_id,
         "tenant_id": tenant_id,
         "doc_id": doc_id,
+        "doc_type": doc_path.suffix.lower().lstrip("."),
         "chars": len(text),
         "text_preview": preview,
     }
@@ -417,16 +486,11 @@ def get_doc_chunks(
     request_id = request.state.request_id
     tenant_id = get_tenant_id(request)
 
-    pdf_path = get_doc_path(tenant_id, doc_id)
-    if not pdf_path.exists():
+    doc_path = get_doc_path(tenant_id, doc_id)
+    if not doc_path.exists():
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Extract text (same pattern as /text)
-    reader = PdfReader(str(pdf_path))
-    parts = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-    text = "\n".join(parts)
+    text = extract_doc_text(doc_path)
 
     chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
 
@@ -441,6 +505,7 @@ def get_doc_chunks(
         tenant_id=tenant_id,
         user_id=None,
         doc_id=doc_id,
+        doc_type=doc_path.suffix.lower().lstrip("."),
         chars=len(text),
         chunk_size=chunk_size,
         overlap=overlap,
@@ -453,6 +518,7 @@ def get_doc_chunks(
         "request_id": request_id,
         "tenant_id": tenant_id,
         "doc_id": doc_id,
+        "doc_type": doc_path.suffix.lower().lstrip("."),
         "chunk_size": chunk_size,
         "overlap": overlap,
         "num_chunks": len(chunks),
@@ -472,7 +538,7 @@ def index_document(
 ):
     """
     Index a document:
-    - extract text from stored PDF
+    - extract text from stored PDF or CSV
     - chunk with overlap
     - embed chunks with Gemini
     - upsert vectors into Pinecone under tenant namespace
@@ -480,17 +546,13 @@ def index_document(
     request_id = request.state.request_id
     tenant_id = get_tenant_id(request)
 
-    # 1) Load PDF
-    pdf_path = get_doc_path(tenant_id, doc_id)
-    if not pdf_path.exists():
+    # 1) Load stored document
+    doc_path = get_doc_path(tenant_id, doc_id)
+    if not doc_path.exists():
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # 2) Extract text (same approach as /text)
-    reader = PdfReader(str(pdf_path))
-    parts = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-    text = "\n".join(parts).strip()
+    # 2) Extract text
+    text = extract_doc_text(doc_path).strip()
 
     if not text:
         return {
@@ -499,6 +561,7 @@ def index_document(
             "request_id": request_id,
             "tenant_id": tenant_id,
             "doc_id": doc_id,
+            "doc_type": doc_path.suffix.lower().lstrip("."),
             "num_chunks": 0,
             "upserted_count": 0,
         }
@@ -561,6 +624,7 @@ def index_document(
         tenant_id=tenant_id,
         user_id=None,
         doc_id=doc_id,
+        doc_type=doc_path.suffix.lower().lstrip("."),
         num_chunks=len(chunks),
         embedding_model="gemini-embedding-001",
         embed_dim=embed_dim,
@@ -573,6 +637,7 @@ def index_document(
         "request_id": request_id,
         "tenant_id": tenant_id,
         "doc_id": doc_id,
+        "doc_type": doc_path.suffix.lower().lstrip("."),
         "num_chunks": len(chunks),
         "embed_dim": embed_dim,
         "upserted_count": upserted_total,

@@ -166,7 +166,7 @@ export default function Home() {
         <p className="hero-kicker">Product Demo</p>
         <h1>Apalym</h1>
         <p className="hero-subtitle">
-          Upload a PDF, ask a question, and verify every answer with scored source citations.
+          Upload a PDF or CSV, ask a question, and verify every answer with scored source citations.
         </p>
 
         <div className="meta-strip">
@@ -195,15 +195,15 @@ export default function Home() {
           </div>
 
           <p className="section-copy">
-            Choose a PDF. We apply stable indexing defaults automatically, with no setup required.
+            Choose a PDF or CSV. We apply stable indexing defaults automatically, with no setup required.
           </p>
 
           <label className="file-input-wrap">
-            <span className="file-input-label">PDF file</span>
+            <span className="file-input-label">Document file (PDF or CSV)</span>
             <input
               className="file-input"
               type="file"
-              accept="application/pdf"
+              accept="application/pdf,text/csv,.csv"
               onChange={(e) => setFile(e.target.files?.[0] ?? null)}
             />
           </label>
@@ -215,7 +215,7 @@ export default function Home() {
           )}
 
           <button onClick={uploadAndIndex} disabled={!canUpload} className="primary-btn full-width">
-            {busy === "upload" ? "Uploading and indexing..." : "Upload PDF"}
+            {busy === "upload" ? "Uploading and indexing..." : "Upload file"}
           </button>
 
           <div className="meta-table">
@@ -243,13 +243,13 @@ export default function Home() {
             <span className={statusClassName(askStatus.tone)}>{askStatus.label}</span>
           </div>
 
-          <p className="section-copy">Ask a question grounded in the uploaded document.</p>
+          <p className="section-copy">Ask a question grounded in the uploaded document data.</p>
 
           <div className="ask-row">
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask a question about your PDF..."
+              placeholder="Ask a question about your PDF or CSV..."
               className="query-input"
             />
             <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
@@ -257,7 +257,7 @@ export default function Home() {
             </button>
           </div>
 
-          {!indexed && <p className="helper-note">Upload and index a PDF to enable Ask.</p>}
+          {!indexed && <p className="helper-note">Upload and index a PDF or CSV to enable Ask.</p>}
 
           <div className="answer-panel">
             <div className="response-module-header">
