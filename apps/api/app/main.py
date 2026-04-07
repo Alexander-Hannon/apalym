@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import csv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File
 from pathlib import Path
+from openpyxl import load_workbook
 from pypdf import PdfReader
 from google import genai
 from pinecone.grpc import PineconeGRPC as Pinecone
@@ -32,7 +33,7 @@ def log_json(**fields):
 
 
 STORAGE_DIR = Path("/app/storage")
-SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv")
+SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv", "xlsx")
 
 def get_tenant_id(request: Request) -> str:
     # For now: hardcoded. Later: from auth / workspace selection.
@@ -54,13 +55,23 @@ def infer_doc_extension(filename: str | None, content_type: str | None) -> str:
     filename_lower = (filename or "").lower()
     content_type_lower = (content_type or "").lower()
 
+    if (
+        filename_lower.endswith(".xlsx")
+        or content_type_lower
+        in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        )
+    ):
+        return "xlsx"
+
     if filename_lower.endswith(".csv") or content_type_lower in ("text/csv", "application/csv"):
         return "csv"
 
     if filename_lower.endswith(".pdf") or content_type_lower in ("application/pdf", "application/octet-stream"):
         return "pdf"
 
-    raise HTTPException(status_code=400, detail="Only PDF and CSV uploads are supported")
+    raise HTTPException(status_code=400, detail="Only PDF, CSV, and XLSX uploads are supported")
 
 
 def extract_pdf_text(doc_path: Path) -> str:
@@ -106,12 +117,67 @@ def extract_csv_text(doc_path: Path) -> str:
         return "\n\n".join(sections)
 
 
+def normalize_sheet_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, float):
+        # Drop trailing .0 for integers stored as floats
+        if value.is_integer():
+            return str(int(value))
+    text = str(value).strip()
+    return text
+
+
+def extract_xlsx_text(doc_path: Path) -> str:
+    workbook = load_workbook(filename=str(doc_path), read_only=True, data_only=True)
+    sections: list[str] = []
+    try:
+        for worksheet in workbook.worksheets:
+            rows = worksheet.iter_rows(values_only=True)
+            sheet_lines = [f"Sheet: {worksheet.title}"]
+
+            first_row = next(rows, None)
+            if first_row is None:
+                sheet_lines.append("(empty sheet)")
+                sections.append("\n".join(sheet_lines))
+                continue
+
+            header_cells = [normalize_sheet_cell(value) for value in first_row]
+            headers = [cell if cell else f"column_{idx + 1}" for idx, cell in enumerate(header_cells)]
+            sheet_lines.append(f"Columns: {', '.join(headers)}")
+
+            row_number = 2
+            for raw_row in rows:
+                row_parts = []
+                for idx, value in enumerate(raw_row):
+                    normalized = normalize_sheet_cell(value)
+                    if not normalized:
+                        continue
+                    label = headers[idx] if idx < len(headers) else f"column_{idx + 1}"
+                    row_parts.append(f"{label}: {normalized}")
+                if row_parts:
+                    sheet_lines.append(f"Row {row_number}: " + ", ".join(row_parts))
+                row_number += 1
+
+            sections.append("\n".join(sheet_lines))
+    finally:
+        workbook.close()
+
+    return "\n\n".join(sections)
+
+
 def extract_doc_text(doc_path: Path) -> str:
     suffix = doc_path.suffix.lower()
     if suffix == ".pdf":
         return extract_pdf_text(doc_path)
     if suffix == ".csv":
         return extract_csv_text(doc_path)
+    if suffix == ".xlsx":
+        return extract_xlsx_text(doc_path)
     raise HTTPException(status_code=400, detail="Unsupported stored document type")
 
 
@@ -538,7 +604,7 @@ def index_document(
 ):
     """
     Index a document:
-    - extract text from stored PDF or CSV
+    - extract text from stored PDF, CSV, or XLSX
     - chunk with overlap
     - embed chunks with Gemini
     - upsert vectors into Pinecone under tenant namespace

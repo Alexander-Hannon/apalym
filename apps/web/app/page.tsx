@@ -166,7 +166,7 @@ export default function Home() {
         <p className="hero-kicker">Product Demo</p>
         <h1>Apalym</h1>
         <p className="hero-subtitle">
-          Upload a PDF or CSV, ask a question, and verify every answer with scored source citations.
+          Upload a PDF, CSV, or XLSX file, ask a question, and verify every answer with scored source citations.
         </p>
 
         <div className="meta-strip">
@@ -195,15 +195,15 @@ export default function Home() {
           </div>
 
           <p className="section-copy">
-            Choose a PDF or CSV. We apply stable indexing defaults automatically, with no setup required.
+            Choose a PDF, CSV, or XLSX file. We apply stable indexing defaults automatically, with no setup required.
           </p>
 
           <label className="file-input-wrap">
-            <span className="file-input-label">Document file (PDF or CSV)</span>
+            <span className="file-input-label">Document file (PDF, CSV, or XLSX)</span>
             <input
               className="file-input"
               type="file"
-              accept="application/pdf,text/csv,.csv"
+              accept="application/pdf,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
               onChange={(e) => setFile(e.target.files?.[0] ?? null)}
             />
           </label>
@@ -249,7 +249,7 @@ export default function Home() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask a question about your PDF or CSV..."
+              placeholder="Ask a question about your PDF, CSV, or XLSX..."
               className="query-input"
             />
             <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
@@ -257,7 +257,7 @@ export default function Home() {
             </button>
           </div>
 
-          {!indexed && <p className="helper-note">Upload and index a PDF or CSV to enable Ask.</p>}
+          {!indexed && <p className="helper-note">Upload and index a PDF, CSV, or XLSX file to enable Ask.</p>}
 
           <div className="answer-panel">
             <div className="response-module-header">
