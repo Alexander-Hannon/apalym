@@ -64,8 +64,6 @@ type InsightBrief = {
   recommendedActions: string[];
 };
 
-const CITATION_TAG_RE = /\[([^\]]+:[^\]]+)\]/g;
-
 function makeRequestId() {
   return `WEB-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
