@@ -387,6 +387,23 @@ def clean_brief_list_items(items: list[Any], fallback: list[str]) -> list[str]:
             cleaned.append(normalized)
     return cleaned if cleaned else fallback
 
+def is_generic_action(text: str) -> bool:
+    normalized = compact_whitespace(text).lower()
+    generic_phrases = (
+        "validate the answer",
+        "validate answer",
+        "ask a follow-up",
+        "ask a follow up",
+        "follow-up question",
+        "follow up question",
+        "cross-check",
+        "cross check",
+        "verify the answer",
+        "review a source",
+        "review sources",
+    )
+    return any(phrase in normalized for phrase in generic_phrases)
+
 def build_dynamic_fallback_actions(query_text: str, matches: list[dict[str, Any]]) -> list[str]:
     q = compact_whitespace(query_text).lower()
     top_match_text = compact_whitespace((matches[0].get("text") if matches else "") or "")
@@ -441,6 +458,29 @@ def build_answer_brief(query_text: str, answer_text: str, matches: list[dict[str
         direct_answer=direct_answer,
         key_findings=key_findings[:4],
         recommended_next_actions=recommended[:4],
+    )
+
+def merge_brief_with_fallback(
+    query_text: str,
+    answer_text: str,
+    parsed_brief: AskBrief | None,
+    matches: list[dict[str, Any]],
+) -> AskBrief:
+    fallback = build_answer_brief(query_text, answer_text, matches)
+    if parsed_brief is None:
+        return fallback
+
+    direct_answer = strip_markdown_emphasis(parsed_brief.direct_answer) or fallback.direct_answer
+    key_findings = clean_brief_list_items(parsed_brief.key_findings, fallback.key_findings)
+
+    candidate_actions = clean_brief_list_items(parsed_brief.recommended_next_actions, [])
+    filtered_actions = [action for action in candidate_actions if not is_generic_action(action)]
+    recommended_actions = filtered_actions if filtered_actions else fallback.recommended_next_actions
+
+    return AskBrief(
+        direct_answer=direct_answer,
+        key_findings=key_findings[:4],
+        recommended_next_actions=recommended_actions[:4],
     )
 
 
@@ -1016,7 +1056,7 @@ def ask(req: AskRequest, request: Request):
             + "\n".join(bullets)
             + "\n\nAnswer mode: extractive (no AI generation)."
         )
-        fallback_brief = build_answer_brief(query_text, fallback_answer, matches)
+        fallback_brief = merge_brief_with_fallback(query_text, fallback_answer, None, matches)
 
         return {
             "ok": True,
@@ -1052,9 +1092,7 @@ def ask(req: AskRequest, request: Request):
         except Exception:
             parsed_brief = None
 
-    final_brief = parsed_brief
-    if final_brief is None:
-        final_brief = build_answer_brief(query_text, answer, matches)
+    final_brief = merge_brief_with_fallback(query_text, answer, parsed_brief, matches)
 
     answer = final_brief.direct_answer
 

@@ -93,6 +93,14 @@ function normalizeCitationToken(raw: string): string {
   return raw.replace(/^\[|\]$/g, "").replace(/\s+/g, "").toLowerCase();
 }
 
+function splitCitationCandidates(tagPayload: string): string[] {
+  return tagPayload
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => normalizeCitationToken(part));
+}
+
 function splitSentences(text: string) {
   return text
     .split(/(?<=[.!?])\s+/)
@@ -209,15 +217,17 @@ function renderTextWithCitationChips(text: string, citationOrder: Map<string, nu
       const tag = part.match(/^\[([^\]]+:[^\]]+)\]$/)?.[1];
       if (!tag) return renderInlineMarkdown(part, `txt-${index}`);
 
-      const order = citationOrder.get(normalizeCitationToken(tag));
-      if (!order) {
-        return [];
-      }
-      return [
-        <span key={`tag-${index}`} className="inline-citation-chip">
+      const candidateOrders = splitCitationCandidates(tag)
+        .map((candidate) => citationOrder.get(candidate))
+        .filter((value): value is number => typeof value === "number");
+      const uniqueOrders = Array.from(new Set(candidateOrders));
+      if (uniqueOrders.length === 0) return [];
+
+      return uniqueOrders.map((order, citationIdx) => (
+        <span key={`tag-${index}-${citationIdx}`} className="inline-citation-chip">
           [{order}]
-        </span>,
-      ];
+        </span>
+      ));
     });
 }
 
