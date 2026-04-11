@@ -77,19 +77,31 @@ function statusClassName(state: "idle" | "ready" | "working" | "complete") {
   return `status-chip status-${state}`;
 }
 
+function normalizeListLine(line: string) {
+  return line
+    .replace(/^((?:[-•*]|\d+[.)])\s+)+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitSentences(text: string) {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
 function buildInsightBrief(answerText: string, question: string, sourceCount: number): InsightBrief {
   const normalizedAnswer = answerText.replace(/\r/g, "").trim();
-  const sentenceCandidates = normalizedAnswer
+  const lines = normalizedAnswer
     .split(/\n+/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .flatMap((line) => line.split(/(?<=[.!?])\s+/).map((segment) => segment.trim()).filter(Boolean));
+    .filter(Boolean);
 
-  const bulletFindings = normalizedAnswer
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => /^[-•*]\s+/.test(line))
-    .map((line) => line.replace(/^[-•*]\s+/, "").trim())
+  const sentenceCandidates = splitSentences(lines.join(" "));
+  const bulletFindings = lines
+    .filter((line) => /^((?:[-•*])|(?:\d+[.)]))\s+/.test(line))
+    .map(normalizeListLine)
     .filter(Boolean);
 
   const directAnswer = sentenceCandidates[0] ?? "No answer available yet.";
@@ -105,12 +117,12 @@ function buildInsightBrief(answerText: string, question: string, sourceCount: nu
     compactQuestion.length > 70 ? `${compactQuestion.slice(0, 67).trimEnd()}...` : compactQuestion;
 
   const recommendedActions = [
-    "Validate the direct answer against the top source before acting.",
+    "Validate the direct answer against source [1] before acting.",
     sourceCount > 1
-      ? "Cross-check at least one additional source to confirm confidence."
-      : "Gather one additional supporting record if this decision is high impact.",
+      ? "Cross-check one additional high-confidence source for consistency."
+      : "Capture one additional supporting data point for higher-confidence decisions.",
     shortQuestion
-      ? `Ask one targeted follow-up on "${shortQuestion}" to close any remaining ambiguity.`
+      ? `Ask one focused follow-up on "${shortQuestion}" to close remaining ambiguity.`
       : "Ask a follow-up question to close any remaining ambiguity.",
   ];
 
@@ -123,7 +135,13 @@ function renderTextWithCitationChips(text: string, citationOrder: Map<string, nu
     if (!tag) return <span key={`txt-${index}`}>{part}</span>;
 
     const order = citationOrder.get(tag);
-    if (!order) return <span key={`tag-${index}`}>{part}</span>;
+    if (!order) {
+      return (
+        <span key={`tag-${index}`} className="inline-citation-chip unknown">
+          [?]
+        </span>
+      );
+    }
     return (
       <span key={`tag-${index}`} className="inline-citation-chip">
         [{order}]
@@ -148,7 +166,7 @@ export default function Home() {
   const [doc, setDoc] = useState<UploadResp | null>(null);
   const [indexed, setIndexed] = useState<IndexResp | null>(null);
 
-  const [query, setQuery] = useState("What does being dialed in mean?");
+  const [query, setQuery] = useState("");
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [sourceMatches, setSourceMatches] = useState<RetrievalMatch[]>([]);
@@ -165,7 +183,7 @@ export default function Home() {
   );
 
   const canUpload = Boolean(file) && busy === null;
-  const canAsk = Boolean(indexed) && busy === null;
+  const canAsk = Boolean(indexed) && busy === null && query.trim().length > 0;
   const hasAssistantAnswer = chat.some((entry) => entry.role === "assistant");
   const latestQuestion = [...chat].reverse().find((entry) => entry.role === "user")?.text ?? "";
   const latestAssistantMessage = [...chat].reverse().find((entry) => entry.role === "assistant")?.text ?? "";
@@ -222,15 +240,18 @@ export default function Home() {
   }
 
   async function ask() {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) return;
+
     setErr(null);
     setBusy("ask");
     setAnswerMode(null);
 
     // Show the user question immediately
-    setChat((c) => [...c, { role: "user", text: query }]);
+    setChat((c) => [...c, { role: "user", text: trimmedQuery }]);
 
     try {
-      const resp = (await postJson("/v1/ask", { query, top_k: 5 }, headers)) as AskResp;
+      const resp = (await postJson("/v1/ask", { query: trimmedQuery, top_k: 5 }, headers)) as AskResp;
 
       if (!resp.ok) {
         const msg = resp.message || "Ask failed";
@@ -408,7 +429,7 @@ export default function Home() {
                     </p>
 
                     <div className="insight-grid">
-                      <section className="insight-section">
+                      <section className="insight-section findings">
                         <h5>Key findings</h5>
                         <ul>
                           {insightBrief.keyFindings.map((finding, index) => (
@@ -417,7 +438,7 @@ export default function Home() {
                         </ul>
                       </section>
 
-                      <section className="insight-section">
+                      <section className="insight-section actions">
                         <h5>Recommended next actions</h5>
                         <ul>
                           {insightBrief.recommendedActions.map((action, index) => (
@@ -443,24 +464,24 @@ export default function Home() {
                   const confidence = confidenceBand(citation.score);
 
                   return (
-                  <details key={citation.source_id} className="source-card">
-                    <summary>
-                      <span className="source-rank">[{index + 1}]</span>
-                      <div className="source-summary-main">
-                        <span className="source-id">
-                          {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
+                    <details key={citation.source_id} className="source-card">
+                      <summary>
+                        <span className="source-rank">[{index + 1}]</span>
+                        <div className="source-summary-main">
+                          <span className="source-id">
+                            {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
+                          </span>
+                          <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
+                        </div>
+                        <span className="source-range">
+                          score {citation.score.toFixed(3)} • chars {citation.start}-{citation.end}
                         </span>
-                        <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
+                      </summary>
+                      {match?.text && <p className="source-excerpt">{match.text}</p>}
+                      <div className="source-note">
+                        Source ID: <code>{citation.source_id}</code>
                       </div>
-                      <span className="source-range">
-                        score {citation.score.toFixed(3)} • chars {citation.start}-{citation.end}
-                      </span>
-                    </summary>
-                    {match?.text && <p className="source-excerpt">{match.text}</p>}
-                    <div className="source-note">
-                      Source ID: <code>{citation.source_id}</code>
-                    </div>
-                  </details>
+                    </details>
                   );
                 })}
               </div>

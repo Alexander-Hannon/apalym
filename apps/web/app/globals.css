@@ -489,7 +489,7 @@ code {
 .insight-grid {
   margin-top: 12px;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
   gap: 12px;
 }
 
@@ -498,6 +498,16 @@ code {
   border-radius: 12px;
   padding: 10px 11px;
   background: rgba(20, 26, 45, 0.7);
+}
+
+.insight-section.findings {
+  border-color: rgba(150, 127, 255, 0.4);
+  background: rgba(35, 31, 63, 0.62);
+}
+
+.insight-section.actions {
+  border-color: rgba(120, 133, 188, 0.32);
+  background: rgba(20, 26, 45, 0.52);
 }
 
 .insight-section h5 {
@@ -518,6 +528,27 @@ code {
 .insight-section li {
   color: #dde4ff;
   font-size: 13px;
+  line-height: 1.45;
+}
+
+.insight-section.findings h5 {
+  color: #e2d8ff;
+}
+
+.insight-section.findings li {
+  color: #f0eaff;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.insight-section.actions h5 {
+  color: #bfc9ee;
+  opacity: 0.95;
+}
+
+.insight-section.actions li {
+  color: #bdc9ef;
+  font-size: 12px;
   line-height: 1.45;
 }
 
