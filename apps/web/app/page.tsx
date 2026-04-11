@@ -38,6 +38,11 @@ type AskResp = {
   query: string;
   answer?: string;
   answer_mode?: "rag" | "extractive";
+  brief?: {
+    direct_answer: string;
+    key_findings: string[];
+    recommended_next_actions: string[];
+  };
   citations?: Citation[];
   matches?: RetrievalMatch[];
   error?: string;
@@ -84,6 +89,10 @@ function normalizeListLine(line: string) {
     .trim();
 }
 
+function normalizeCitationToken(raw: string): string {
+  return raw.replace(/^\[|\]$/g, "").replace(/\s+/g, "").toLowerCase();
+}
+
 function splitSentences(text: string) {
   return text
     .split(/(?<=[.!?])\s+/)
@@ -91,7 +100,51 @@ function splitSentences(text: string) {
     .filter(Boolean);
 }
 
-function buildInsightBrief(answerText: string, question: string, sourceCount: number): InsightBrief {
+function buildDynamicActions(question: string, findings: string[]): string[] {
+  const q = question.trim().toLowerCase();
+  const findingPreview = findings[0] ?? "";
+
+  if (/(aging|receivable|a\/r|invoice|overdue)/.test(q)) {
+    return [
+      "Review AR aging over 60 days and assign collection owners for the largest overdue balances.",
+      "Compare overdue exposure by customer segment and escalate the highest-risk accounts this cycle.",
+    ];
+  }
+  if (/(fleet|vehicle|van|maintenance)/.test(q)) {
+    return [
+      "Audit fleet maintenance costs by vehicle and prioritize units with repeat high-cost repairs.",
+      "Separate preventive vs. reactive maintenance spend and schedule interventions for outlier vans.",
+    ];
+  }
+  if (/(discount|pricing|margin|category)/.test(q)) {
+    return [
+      "Check discounting by category and flag segments where discount depth is eroding margin.",
+      "Review high-discount transactions for approval-policy breaches and adjust pricing controls.",
+    ];
+  }
+
+  const focusedQuestion =
+    question.trim().length > 90 ? `${question.trim().slice(0, 87).trimEnd()}...` : question.trim();
+  const evidenceHint = findingPreview ? ` Start with: ${findingPreview}` : "";
+  return [
+    `Drill into '${focusedQuestion}' by segment, owner, and period to isolate the highest-impact outliers.${evidenceHint}`,
+    "Translate the top cited finding into an owner, target metric, and review date for this reporting cycle.",
+  ];
+}
+
+function buildInsightBrief(
+  answerText: string,
+  question: string,
+  serverBrief?: AskResp["brief"]
+): InsightBrief {
+  if (serverBrief) {
+    return {
+      directAnswer: serverBrief.direct_answer,
+      keyFindings: serverBrief.key_findings,
+      recommendedActions: serverBrief.recommended_next_actions,
+    };
+  }
+
   const normalizedAnswer = answerText.replace(/\r/g, "").trim();
   const lines = normalizedAnswer
     .split(/\n+/)
@@ -116,38 +169,56 @@ function buildInsightBrief(answerText: string, question: string, sourceCount: nu
   const shortQuestion =
     compactQuestion.length > 70 ? `${compactQuestion.slice(0, 67).trimEnd()}...` : compactQuestion;
 
-  const recommendedActions = [
-    "Validate the direct answer against source [1] before acting.",
-    sourceCount > 1
-      ? "Cross-check one additional high-confidence source for consistency."
-      : "Capture one additional supporting data point for higher-confidence decisions.",
-    shortQuestion
-      ? `Ask one focused follow-up on "${shortQuestion}" to close remaining ambiguity.`
-      : "Ask a follow-up question to close any remaining ambiguity.",
-  ];
+  const recommendedActions = buildDynamicActions(shortQuestion, keyFindings);
 
   return { directAnswer, keyFindings, recommendedActions };
 }
 
-function renderTextWithCitationChips(text: string, citationOrder: Map<string, number>): ReactNode[] {
-  return text.split(/(\[[^\]]+:[^\]]+\])/g).filter(Boolean).map((part, index) => {
-    const tag = part.match(/^\[([^\]]+:[^\]]+)\]$/)?.[1];
-    if (!tag) return <span key={`txt-${index}`}>{part}</span>;
+function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const regex = /(\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
 
-    const order = citationOrder.get(tag);
-    if (!order) {
-      return (
-        <span key={`tag-${index}`} className="inline-citation-chip unknown">
-          [?]
-        </span>
-      );
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(<span key={`${keyPrefix}-txt-${lastIndex}`}>{text.slice(lastIndex, match.index)}</span>);
     }
-    return (
-      <span key={`tag-${index}`} className="inline-citation-chip">
-        [{order}]
-      </span>
-    );
-  });
+
+    const token = match[0];
+    if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(<strong key={`${keyPrefix}-bold-${match.index}`}>{token.slice(2, -2)}</strong>);
+    } else {
+      nodes.push(<em key={`${keyPrefix}-em-${match.index}`}>{token.slice(1, -1)}</em>);
+    }
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(<span key={`${keyPrefix}-tail-${lastIndex}`}>{text.slice(lastIndex)}</span>);
+  }
+
+  return nodes.length > 0 ? nodes : [<span key={`${keyPrefix}-full`}>{text}</span>];
+}
+
+function renderTextWithCitationChips(text: string, citationOrder: Map<string, number>): ReactNode[] {
+  return text
+    .split(/(\[[^\]]+:[^\]]+\])/g)
+    .filter(Boolean)
+    .flatMap((part, index) => {
+      const tag = part.match(/^\[([^\]]+:[^\]]+)\]$/)?.[1];
+      if (!tag) return renderInlineMarkdown(part, `txt-${index}`);
+
+      const order = citationOrder.get(normalizeCitationToken(tag));
+      if (!order) {
+        return [];
+      }
+      return [
+        <span key={`tag-${index}`} className="inline-citation-chip">
+          [{order}]
+        </span>,
+      ];
+    });
 }
 
 function confidenceBand(score: number) {
@@ -170,6 +241,7 @@ export default function Home() {
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [sourceMatches, setSourceMatches] = useState<RetrievalMatch[]>([]);
+  const [briefFromServer, setBriefFromServer] = useState<AskResp["brief"]>();
   const [answerMode, setAnswerMode] = useState<AskResp["answer_mode"] | null>(null);
   const [busy, setBusy] = useState<null | "upload" | "ask">(null);
   const [err, setErr] = useState<string | null>(null);
@@ -191,7 +263,8 @@ export default function Home() {
   const citationOrder = useMemo(() => {
     const lookup = new Map<string, number>();
     citations.forEach((citation, index) => {
-      lookup.set(citation.source_id, index + 1);
+      lookup.set(normalizeCitationToken(citation.source_id), index + 1);
+      lookup.set(normalizeCitationToken(`${citation.doc_id}:${citation.chunk_id}`), index + 1);
     });
     return lookup;
   }, [citations]);
@@ -205,8 +278,8 @@ export default function Home() {
   }, [sourceMatches]);
 
   const insightBrief = useMemo(
-    () => buildInsightBrief(latestAssistantMessage, latestQuestion, citations.length),
-    [latestAssistantMessage, latestQuestion, citations.length]
+    () => buildInsightBrief(latestAssistantMessage, latestQuestion, briefFromServer),
+    [latestAssistantMessage, latestQuestion, briefFromServer]
   );
 
   async function uploadAndIndex() {
@@ -246,6 +319,7 @@ export default function Home() {
     setErr(null);
     setBusy("ask");
     setAnswerMode(null);
+    setBriefFromServer(undefined);
 
     // Show the user question immediately
     setChat((c) => [...c, { role: "user", text: trimmedQuery }]);
@@ -258,6 +332,7 @@ export default function Home() {
         setChat((c) => [...c, { role: "assistant", text: `⚠️ ${msg}` }]);
         setCitations(resp.citations ?? []);
         setSourceMatches(resp.matches ?? []);
+        setBriefFromServer(resp.brief);
         setAnswerMode(resp.answer_mode ?? null);
         return;
       }
@@ -265,10 +340,12 @@ export default function Home() {
       setChat((c) => [...c, { role: "assistant", text: resp.answer ?? "" }]);
       setCitations(resp.citations ?? []);
       setSourceMatches(resp.matches ?? []);
+      setBriefFromServer(resp.brief);
       setAnswerMode(resp.answer_mode ?? "rag");
     } catch (e: unknown) {
       setErr(asErrorMessage(e, "Ask failed"));
       setSourceMatches([]);
+      setBriefFromServer(undefined);
     } finally {
       setBusy(null);
     }

@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 import csv
+import re
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -359,6 +360,108 @@ class AskRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(5, ge=1, le=10)
     doc_id: Optional[str] = None  # optional: restrict to a document
+
+class AskBrief(BaseModel):
+    direct_answer: str
+    key_findings: list[str]
+    recommended_next_actions: list[str]
+
+def compact_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def strip_markdown_emphasis(text: str) -> str:
+    # Keep plain text if model returns markdown emphasis or code markers.
+    no_code = re.sub(r"`([^`]+)`", r"\1", text)
+    no_bold = re.sub(r"\*\*([^*]+)\*\*", r"\1", no_code)
+    no_italic_star = re.sub(r"\*([^*]+)\*", r"\1", no_bold)
+    no_italic_underscore = re.sub(r"_([^_]+)_", r"\1", no_italic_star)
+    return compact_whitespace(no_italic_underscore)
+
+def clean_brief_list_items(items: list[Any], fallback: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        normalized = strip_markdown_emphasis(item).lstrip("-• ").strip()
+        if normalized:
+            cleaned.append(normalized)
+    return cleaned if cleaned else fallback
+
+def build_dynamic_fallback_actions(query_text: str, matches: list[dict[str, Any]]) -> list[str]:
+    q = compact_whitespace(query_text).lower()
+    top_match_text = compact_whitespace((matches[0].get("text") if matches else "") or "")
+    snippet = top_match_text[:140] + ("..." if len(top_match_text) > 140 else "")
+
+    if any(token in q for token in ("aging", "receivable", "ar ", "a/r", "invoice")):
+        return [
+            "Review AR balances over 60 days and prioritize top delinquent accounts for collection outreach this week.",
+            "Break down overdue receivables by customer segment and assign owners for high-exposure accounts."
+        ]
+    if any(token in q for token in ("fleet", "vehicle", "van", "maintenance")):
+        return [
+            "Audit maintenance spend by vehicle and flag units above the fleet median for immediate review.",
+            "Compare preventive vs. reactive maintenance patterns and schedule interventions for high-cost vehicles."
+        ]
+    if any(token in q for token in ("discount", "pricing", "margin", "category")):
+        return [
+            "Check discount rates by category and identify where discounting is compressing margin beyond policy thresholds.",
+            "Review outlier deals with high discount percentages and require approval adjustments for repeat patterns."
+        ]
+    if any(token in q for token in ("churn", "retention", "renewal")):
+        return [
+            "Segment at-risk accounts by renewal window and trigger targeted retention actions for the highest-risk tier.",
+            "Analyze drivers shared across churn-risk accounts and feed the top driver into next-cycle account plans."
+        ]
+
+    generic = f"Run a focused drill-down on '{compact_whitespace(query_text)}' by segment, owner, and period to isolate decision-ready outliers."
+    if snippet:
+        generic += f" Start with this evidence thread: {snippet}"
+    return [
+        generic,
+        "Convert the top finding into an operational action owner, target metric, and review date for this reporting cycle.",
+    ]
+
+def build_answer_brief(query_text: str, answer_text: str, matches: list[dict[str, Any]]) -> AskBrief:
+    normalized_answer = (answer_text or "").strip()
+    lines = [line.strip() for line in normalized_answer.replace("\r", "").splitlines() if line.strip()]
+    clean_lines = [strip_markdown_emphasis(line) for line in lines if strip_markdown_emphasis(line)]
+
+    direct_answer = clean_lines[0] if clean_lines else "I couldn't generate a clear direct answer from the provided excerpts."
+
+    bullet_like = []
+    for line in clean_lines:
+        if re.match(r"^((?:[-•*])|(?:\d+[.)]))\s+", line):
+            bullet_like.append(re.sub(r"^((?:[-•*])|(?:\d+[.)]))\s+", "", line).strip())
+    key_findings = bullet_like[:4] if bullet_like else clean_lines[1:5]
+    if not key_findings:
+        key_findings = [direct_answer]
+
+    recommended = build_dynamic_fallback_actions(query_text, matches)
+    return AskBrief(
+        direct_answer=direct_answer,
+        key_findings=key_findings[:4],
+        recommended_next_actions=recommended[:4],
+    )
+
+
+def parse_model_json(text: str) -> dict | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    # Handle model responses wrapped in markdown fences.
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:].strip()
+
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
 
 
 #---------------------------------------------
@@ -862,11 +965,21 @@ def ask(req: AskRequest, request: Request):
         "Answer the question using only the excerpts. Include citations."
     )
 
+    brief_instruction = (
+        "Return JSON with keys: direct_answer, key_findings, recommended_next_actions.\n"
+        "Rules:\n"
+        "- direct_answer: one concise business answer with citations like [doc_id:chunk_id]\n"
+        "- key_findings: 2-4 concrete findings tied to the provided evidence and include citations\n"
+        "- recommended_next_actions: 2-4 specific operational/business next steps tailored to the question and evidence\n"
+        "- Do NOT output generic filler like 'validate answer' or 'ask follow-up'\n"
+        "- Return ONLY valid JSON"
+    )
+
     # 3) Generate answer (Gemini)
     gemini = get_gemini_client()
     model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
 
-    full_prompt = f"{system_instruction}\n\n{user_prompt}"
+    full_prompt = f"{system_instruction}\n\n{user_prompt}\n\n{brief_instruction}"
 
     try:
         resp = gemini.models.generate_content(
@@ -903,6 +1016,7 @@ def ask(req: AskRequest, request: Request):
             + "\n".join(bullets)
             + "\n\nAnswer mode: extractive (no AI generation)."
         )
+        fallback_brief = build_answer_brief(query_text, fallback_answer, matches)
 
         return {
             "ok": True,
@@ -912,6 +1026,11 @@ def ask(req: AskRequest, request: Request):
             "query": req.query,
             "answer": fallback_answer,
             "answer_mode": "extractive",
+            "brief": {
+                "direct_answer": fallback_brief.direct_answer,
+                "key_findings": fallback_brief.key_findings,
+                "recommended_next_actions": fallback_brief.recommended_next_actions,
+            },
             "citations": citations,
             "matches": matches,
         }
@@ -924,6 +1043,20 @@ def ask(req: AskRequest, request: Request):
         answer = resp.get("text")
     if not answer:
         answer = "I couldn't generate an answer from the provided excerpts."
+
+    parsed_brief: AskBrief | None = None
+    brief_obj = parse_model_json(answer)
+    if brief_obj is not None:
+        try:
+            parsed_brief = AskBrief.model_validate(brief_obj)
+        except Exception:
+            parsed_brief = None
+
+    final_brief = parsed_brief
+    if final_brief is None:
+        final_brief = build_answer_brief(query_text, answer, matches)
+
+    answer = final_brief.direct_answer
 
     # Extract token usage if the SDK exposes it
     usage_metadata = getattr(resp, "usage_metadata", None)
@@ -958,7 +1091,7 @@ def ask(req: AskRequest, request: Request):
         token_usage=token_usage,
     )
 
-    return {
+    response_payload = {
         "ok": True,
         "service": "api",
         "request_id": request_id,
@@ -969,4 +1102,12 @@ def ask(req: AskRequest, request: Request):
         "citations": citations,
         "matches": matches,  # keep for debugging/UI “sources panel”
     }
+
+    response_payload["brief"] = {
+        "direct_answer": final_brief.direct_answer,
+        "key_findings": final_brief.key_findings,
+        "recommended_next_actions": final_brief.recommended_next_actions,
+    }
+
+    return response_payload
 
