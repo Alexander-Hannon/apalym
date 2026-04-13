@@ -866,7 +866,7 @@ def search(req: SearchRequest, request: Request):
     embed_dim = 768
     gemini = get_gemini_client()
     result = gemini.models.embed_content(
-        model="gemini-embedding-001",
+        model="gemini-3-flash",
         contents=[query_text],
         config={"output_dimensionality": embed_dim},
     )
