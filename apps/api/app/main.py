@@ -1017,7 +1017,7 @@ def ask(req: AskRequest, request: Request):
 
     # 3) Generate answer (Gemini)
     gemini = get_gemini_client()
-    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
+    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.0-flash")
 
     full_prompt = f"{system_instruction}\n\n{user_prompt}\n\n{brief_instruction}"
 
