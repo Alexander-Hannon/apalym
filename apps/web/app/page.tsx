@@ -325,6 +325,11 @@ export default function Home() {
   async function ask() {
     const trimmedQuery = query.trim();
     if (!trimmedQuery) return;
+    const activeDocId = indexed?.doc_id ?? doc?.doc_id;
+    if (!activeDocId) {
+      setErr("Upload and index a document before asking a question.");
+      return;
+    }
 
     setErr(null);
     setBusy("ask");
@@ -335,7 +340,11 @@ export default function Home() {
     setChat((c) => [...c, { role: "user", text: trimmedQuery }]);
 
     try {
-      const resp = (await postJson("/v1/ask", { query: trimmedQuery, top_k: 5 }, headers)) as AskResp;
+      const resp = (await postJson(
+        "/v1/ask",
+        { query: trimmedQuery, top_k: 3, doc_id: activeDocId },
+        headers
+      )) as AskResp;
 
       if (!resp.ok) {
         const msg = resp.message || "Ask failed";
