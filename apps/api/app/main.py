@@ -347,6 +347,11 @@ def retrieve_matches(
 # CLASSES
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "http://ai:8001")
+ASK_TOP_K_CAP = 3
+ASK_MAX_CHUNK_CHARS = 600
+ASK_MAX_CONTEXT_CHARS = 1800
+ASK_MAX_GENERATION_ATTEMPTS = 3
+ASK_RETRY_BASE_BACKOFF_SECONDS = 0.6
 
 class DemoRequest(BaseModel):
     message: str
@@ -358,7 +363,7 @@ class SearchRequest(BaseModel):
 
 class AskRequest(BaseModel):
     query: str = Field(..., min_length=1)
-    top_k: int = Field(5, ge=1, le=10)
+    top_k: int = Field(3, ge=1, le=10)
     doc_id: Optional[str] = None  # optional: restrict to a document
 
 class AskBrief(BaseModel):
@@ -482,6 +487,97 @@ def merge_brief_with_fallback(
         key_findings=key_findings[:4],
         recommended_next_actions=recommended_actions[:4],
     )
+
+def trim_snippet_text(text: str, max_chars: int) -> str:
+    compact = compact_whitespace(text)
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 1].rstrip() + "…"
+
+
+def build_context_snippets(
+    matches: list[dict[str, Any]],
+    max_chunk_chars: int = ASK_MAX_CHUNK_CHARS,
+    max_total_chars: int = ASK_MAX_CONTEXT_CHARS,
+) -> tuple[list[str], int]:
+    snippets: list[str] = []
+    total_chars = 0
+
+    for m in matches:
+        md = m["metadata"]
+        tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
+        trimmed_text = trim_snippet_text((m.get("text") or "").strip(), max_chunk_chars)
+        if not trimmed_text:
+            continue
+
+        snippet = f"{tag}\n{trimmed_text}"
+        snippet_len = len(snippet)
+        if snippets and total_chars + snippet_len > max_total_chars:
+            break
+        if not snippets and snippet_len > max_total_chars:
+            snippet = snippet[: max_total_chars - 1].rstrip() + "…"
+            snippet_len = len(snippet)
+
+        snippets.append(snippet)
+        total_chars += snippet_len
+        if total_chars >= max_total_chars:
+            break
+
+    return snippets, total_chars
+
+
+def is_retryable_generation_error(error: genai_errors.ClientError) -> bool:
+    detail = str(error).lower()
+    return (
+        "429" in detail
+        or "resource_exhausted" in detail
+        or "rate limit" in detail
+        or "quota" in detail
+    )
+
+
+def generate_content_with_retry(
+    gemini: genai.Client,
+    model_name: str,
+    full_prompt: str,
+    request_id: str,
+    tenant_id: str,
+    retrieved_k: int,
+) -> Any:
+    last_error: genai_errors.ClientError | None = None
+
+    for attempt in range(1, ASK_MAX_GENERATION_ATTEMPTS + 1):
+        try:
+            return gemini.models.generate_content(
+                model=model_name,
+                contents=full_prompt,
+            )
+        except genai_errors.ClientError as error:
+            last_error = error
+            retryable = is_retryable_generation_error(error)
+            if not retryable or attempt >= ASK_MAX_GENERATION_ATTEMPTS:
+                raise
+
+            backoff_seconds = ASK_RETRY_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            log_json(
+                level="WARNING",
+                event="llm_call_retry",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                llm_provider="google",
+                llm_model=model_name,
+                retrieved_k=retrieved_k,
+                attempt=attempt,
+                backoff_seconds=backoff_seconds,
+                error="GENAI_CLIENT_ERROR",
+                detail=str(error)[:300],
+            )
+            time.sleep(backoff_seconds)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unexpected empty generation retry result")
 
 
 def parse_model_json(text: str) -> dict | None:
@@ -963,9 +1059,13 @@ def ask(req: AskRequest, request: Request):
     query_text = req.query.strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
+    if not req.doc_id:
+        raise HTTPException(status_code=400, detail="doc_id is required for ask in demo mode")
 
-    # 1) Retrieve top chunks
-    matches = retrieve_matches(tenant_id, query_text, req.top_k, req.doc_id, request_id=request_id)
+    effective_top_k = max(1, min(req.top_k, ASK_TOP_K_CAP))
+
+    # 1) Retrieve top chunks scoped to active document
+    matches = retrieve_matches(tenant_id, query_text, effective_top_k, req.doc_id, request_id=request_id)
 
     if not matches:
         return {
@@ -979,18 +1079,9 @@ def ask(req: AskRequest, request: Request):
             "matches": [],
         }
 
-    # 2) Build grounded context with explicit citations
-    # We'll tag each snippet like: [doc_id:chunk_id]
-    snippets = []
-    citations = []
-    for m in matches:
-        md = m["metadata"]
-        tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
-        text = (m.get("text") or "").strip()
-        if text:
-            snippets.append(f"{tag}\n{text}")
-        citations.append(m["citation"])
-
+    # 2) Build bounded grounded context with explicit citations
+    snippets, context_chars = build_context_snippets(matches)
+    citations = [m["citation"] for m in matches]
     context_block = "\n\n---\n\n".join(snippets)
 
     system_instruction = (
@@ -1022,9 +1113,13 @@ def ask(req: AskRequest, request: Request):
     full_prompt = f"{system_instruction}\n\n{user_prompt}\n\n{brief_instruction}"
 
     try:
-        resp = gemini.models.generate_content(
-            model=model_name,
-            contents=full_prompt,
+        resp = generate_content_with_retry(
+            gemini=gemini,
+            model_name=model_name,
+            full_prompt=full_prompt,
+            request_id=request_id,
+            tenant_id=tenant_id,
+            retrieved_k=len(matches),
         )
     except genai_errors.ClientError as e:
         msg = str(e)
@@ -1040,6 +1135,9 @@ def ask(req: AskRequest, request: Request):
             error="GENAI_CLIENT_ERROR",
             detail=msg[:500],
             retrieved_k=len(matches),
+            context_chars=context_chars,
+            top_k=effective_top_k,
+            doc_id_filter=req.doc_id,
             token_usage=None,
         )
         # Extractive fallback: answer from sources without generation
@@ -1124,7 +1222,8 @@ def ask(req: AskRequest, request: Request):
         answer_mode="rag",
         retrieved_k=len(matches),
         retrieved_doc_ids=sorted(retrieved_doc_ids) if retrieved_doc_ids else None,
-        top_k=req.top_k,
+        top_k=effective_top_k,
+        context_chars=context_chars,
         doc_id_filter=req.doc_id,
         token_usage=token_usage,
     )
