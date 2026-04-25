@@ -94,6 +94,14 @@ type InsightBrief = {
   recommendedActions: string[];
 };
 
+const INSIGHT_TABS = [
+  { moduleId: "loss-leakage", label: "Loss" },
+  { moduleId: "top-cost-drivers", label: "Costs" },
+  { moduleId: "key-risks", label: "Risks" },
+  { moduleId: "margin-opportunities", label: "Margins" },
+  { moduleId: "trends-anomalies", label: "Trends" },
+] as const;
+
 function makeRequestId() {
   return `WEB-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -101,10 +109,6 @@ function makeRequestId() {
 function asErrorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message) return error.message;
   return fallback;
-}
-
-function statusClassName(state: "idle" | "ready" | "working" | "complete") {
-  return `status-chip status-${state}`;
 }
 
 function normalizeListLine(line: string) {
@@ -124,6 +128,20 @@ function splitCitationCandidates(tagPayload: string): string[] {
     .map((part) => part.trim())
     .filter(Boolean)
     .map((part) => normalizeCitationToken(part));
+}
+
+function stripRawUuidCitationNoise(text: string): string {
+  if (!text) return text;
+  // Remove stray raw UUID citation bundles from model output while keeping prose intact.
+  return text
+    .replace(/\[[0-9a-f]{8}-[0-9a-f-]{27}(?:\s*,\s*[0-9a-f]{8}-[0-9a-f-]{27})*\]/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function cleanExecutiveActionText(text: string): string {
+  if (!text) return "";
+  return stripRawUuidCitationNoise(text).replace(/\[[^\]]*:[^\]]*\]/g, "").replace(/\s{2,}/g, " ").trim();
 }
 
 function splitSentences(text: string) {
@@ -203,7 +221,6 @@ function buildInsightBrief(
     compactQuestion.length > 70 ? `${compactQuestion.slice(0, 67).trimEnd()}...` : compactQuestion;
 
   const recommendedActions = buildDynamicActions(shortQuestion, keyFindings);
-
   return { directAnswer, keyFindings, recommendedActions };
 }
 
@@ -235,7 +252,8 @@ function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
 }
 
 function renderTextWithCitationChips(text: string, citationOrder: Map<string, number>): ReactNode[] {
-  return text
+  const cleanedText = stripRawUuidCitationNoise(text);
+  return cleanedText
     .split(/(\[[^\]]+:[^\]]+\])/g)
     .filter(Boolean)
     .flatMap((part, index) => {
@@ -256,20 +274,6 @@ function renderTextWithCitationChips(text: string, citationOrder: Map<string, nu
     });
 }
 
-function confidenceBand(score: number | null | undefined) {
-  if (typeof score !== "number") return { label: "No score", tone: "low" as const };
-  if (score >= 0.75) return { label: "High confidence", tone: "high" as const };
-  if (score >= 0.55) return { label: "Medium confidence", tone: "medium" as const };
-  return { label: "Low confidence", tone: "low" as const };
-}
-
-function formatModuleStatus(status: InsightModuleStatus): string {
-  if (status === "ok") return "Ready";
-  if (status === "fallback") return "Fallback";
-  if (status === "insufficient_evidence") return "Limited evidence";
-  return "Failed";
-}
-
 function buildCitationOrder(citations: Citation[]): Map<string, number> {
   const lookup = new Map<string, number>();
   citations.forEach((citation, index) => {
@@ -281,29 +285,21 @@ function buildCitationOrder(citations: Citation[]): Map<string, number> {
   return lookup;
 }
 
-function scoreInsightCoverage(modules: InsightModule[]) {
-  return modules.reduce(
-    (acc, module) => {
-      if (module.status === "ok") acc.ok += 1;
-      if (module.status === "fallback") acc.fallback += 1;
-      if (module.status === "insufficient_evidence") acc.insufficient += 1;
-      if (module.status === "failed") acc.failed += 1;
-      return acc;
-    },
-    { ok: 0, fallback: 0, insufficient: 0, failed: 0 }
-  );
+function statusHintForInsight(status: InsightModuleStatus): string {
+  if (status === "ok") return "";
+  if (status === "insufficient_evidence") return "Limited evidence is available for this module in the current document.";
+  if (status === "fallback") return "Using fallback synthesis due to temporary model constraints.";
+  return "This module could not be fully generated for the current run.";
 }
 
 export default function Home() {
   const tenantId = "demo-tenant";
-
-  const [requestId, setRequestId] = useState(makeRequestId());
+  const [requestId] = useState(makeRequestId());
   const [file, setFile] = useState<File | null>(null);
-
   const [doc, setDoc] = useState<UploadResp | null>(null);
   const [indexed, setIndexed] = useState<IndexResp | null>(null);
   const [insights, setInsights] = useState<InsightModule[]>([]);
-  const [insightsMeta, setInsightsMeta] = useState<{ moduleCount: number; successfulModules: number } | null>(null);
+  const [activeInsightId, setActiveInsightId] = useState<string>(INSIGHT_TABS[0].moduleId);
 
   const [query, setQuery] = useState("");
   const [chat, setChat] = useState<ChatMessage[]>([]);
@@ -325,9 +321,33 @@ export default function Home() {
   const canUpload = Boolean(file) && busy === null;
   const canRegenerateInsights = Boolean(indexed) && busy === null;
   const canAsk = Boolean(indexed) && busy === null && query.trim().length > 0;
-  const hasAssistantAnswer = chat.some((entry) => entry.role === "assistant");
   const latestQuestion = [...chat].reverse().find((entry) => entry.role === "user")?.text ?? "";
   const latestAssistantMessage = [...chat].reverse().find((entry) => entry.role === "assistant")?.text ?? "";
+
+  const insightsById = useMemo(() => {
+    const map = new Map<string, InsightModule>();
+    insights.forEach((module) => map.set(module.module_id, module));
+    return map;
+  }, [insights]);
+
+  const selectedInsightId = useMemo(() => {
+    if (insightsById.has(activeInsightId)) return activeInsightId;
+    const firstAvailable = INSIGHT_TABS.find((tab) => insightsById.has(tab.moduleId));
+    return firstAvailable?.moduleId ?? activeInsightId;
+  }, [activeInsightId, insightsById]);
+
+  const selectedInsight = insightsById.get(selectedInsightId);
+
+  const selectedCitationOrder = useMemo(
+    () => buildCitationOrder(selectedInsight?.citations ?? []),
+    [selectedInsight]
+  );
+
+  const selectedMatchesBySource = useMemo(() => {
+    const lookup = new Map<string, RetrievalMatch>();
+    (selectedInsight?.matches ?? []).forEach((match) => lookup.set(match.id, match));
+    return lookup;
+  }, [selectedInsight]);
 
   const citationOrder = useMemo(() => buildCitationOrder(citations), [citations]);
 
@@ -339,27 +359,18 @@ export default function Home() {
     return lookup;
   }, [sourceMatches]);
 
-  const insightsCoverage = useMemo(() => scoreInsightCoverage(insights), [insights]);
-
   const insightBrief = useMemo(
     () => buildInsightBrief(latestAssistantMessage, latestQuestion, briefFromServer),
     [latestAssistantMessage, latestQuestion, briefFromServer]
   );
 
   async function fetchInsights(docId: string, clearOldInsights = false) {
-    if (clearOldInsights) {
-      setInsights([]);
-      setInsightsMeta(null);
-    }
+    if (clearOldInsights) setInsights([]);
 
     setBusy("insights");
     try {
       const resp = (await postJson("/v1/insights", { doc_id: docId, top_k: 4 }, headers)) as InsightsResp;
       setInsights(resp.modules ?? []);
-      setInsightsMeta({
-        moduleCount: resp.module_count ?? (resp.modules?.length ?? 0),
-        successfulModules: resp.successful_modules ?? 0,
-      });
     } catch (e: unknown) {
       setErr(asErrorMessage(e, "Insights generation failed"));
     } finally {
@@ -386,6 +397,8 @@ export default function Home() {
         headers
       )) as IndexResp;
       setIndexed(idx);
+      setActiveInsightId(INSIGHT_TABS[0].moduleId);
+      setInsights([]);
 
       setQuery("");
       setChat([]);
@@ -448,371 +461,249 @@ export default function Home() {
     }
   }
 
-  const uploadStatus =
+  const uploadHint =
     busy === "upload"
-      ? { label: "Processing", tone: "working" as const }
+      ? "Uploading and indexing your document..."
       : indexed
-        ? { label: "Indexed", tone: "complete" as const }
+        ? "Document ready for diagnosis."
         : file
-          ? { label: "Ready", tone: "ready" as const }
-          : { label: "Awaiting file", tone: "idle" as const };
-
-  const insightsStatus =
-    busy === "insights"
-      ? { label: "Diagnosing", tone: "working" as const }
-      : insights.length > 0
-        ? { label: "Ready", tone: "complete" as const }
-        : indexed
-          ? { label: "Queued", tone: "ready" as const }
-          : { label: "Upload first", tone: "idle" as const };
-
-  const askStatus =
-    busy === "ask"
-      ? { label: "Generating answer", tone: "working" as const }
-      : hasAssistantAnswer
-        ? { label: "Answered", tone: "complete" as const }
-        : indexed
-          ? { label: "Ready", tone: "ready" as const }
-          : { label: "Upload first", tone: "idle" as const };
+          ? "File selected. Start diagnosis."
+          : "Choose a document to begin.";
 
   return (
-    <main className="demo-shell">
-      <header className="hero-block">
-        <p className="hero-kicker">Product Demo</p>
-        <h1>Apalym</h1>
+    <main className="demo-shell executive-shell">
+      <header className="hero-block executive-hero">
+        <h1>Executive Brief</h1>
         <p className="hero-subtitle">
-          Upload once, then get an automatic business diagnosis dashboard grounded in citations from your document.
+          Upload one business document and instantly receive a focused diagnosis with findings, actions, and sources.
         </p>
-
-        <div className="meta-strip">
-          <span className="meta-pill">
-            <span className="meta-pill-label">tenant</span>
-            <code>{tenantId}</code>
-          </span>
-          <span className="meta-pill">
-            <span className="meta-pill-label">request_id</span>
-            <code>{requestId}</code>
-          </span>
-          <button onClick={() => setRequestId(makeRequestId())} className="secondary-btn meta-refresh-btn">
-            New request ID
-          </button>
-        </div>
       </header>
 
-      <div className="workflow-grid">
-        <section className="surface-card">
-          <div className="section-heading">
-            <div>
-              <p className="step-kicker">Step 1</p>
-              <h2>Upload document</h2>
-            </div>
-            <span className={statusClassName(uploadStatus.tone)}>{uploadStatus.label}</span>
-          </div>
+      <section className="surface-card upload-card">
+        <div className="surface-heading">
+          <h2>Document upload</h2>
+          <p className="section-copy">PDF, CSV, or XLSX are indexed automatically.</p>
+        </div>
 
-          <p className="section-copy">
-            Choose a PDF, CSV, or XLSX file. The app uploads and indexes it automatically with stable defaults.
+        <label className="file-input-wrap">
+          <span className="file-input-label">Document file</span>
+          <input
+            className="file-input"
+            type="file"
+            accept="application/pdf,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          />
+        </label>
+
+        {file && (
+          <p className="selected-file">
+            Selected: <strong>{file.name}</strong>
           </p>
+        )}
 
-          <label className="file-input-wrap">
-            <span className="file-input-label">Document file (PDF, CSV, or XLSX)</span>
-            <input
-              className="file-input"
-              type="file"
-              accept="application/pdf,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-            />
-          </label>
+        <button onClick={uploadAndIndex} disabled={!canUpload} className="primary-btn full-width">
+          {busy === "upload" ? "Uploading..." : "Upload and diagnose"}
+        </button>
 
-          {file && (
-            <p className="selected-file">
-              Selected: <strong>{file.name}</strong>
-            </p>
-          )}
+        <p className="status-note">{uploadHint}</p>
+        {doc?.filename && <p className="document-pill">Current document: {doc.filename}</p>}
+      </section>
 
-          <button onClick={uploadAndIndex} disabled={!canUpload} className="primary-btn full-width">
-            {busy === "upload" ? "Uploading and indexing..." : "Upload file"}
-          </button>
+      <section className="surface-card brief-card">
+        <div className="surface-heading">
+          <h2>Business diagnosis</h2>
+          <p className="section-copy">One insight at a time, tuned for executive review.</p>
+        </div>
 
-          <div className="meta-table">
-            <div className="meta-row">
-              <span className="meta-key">Document</span>
-              <span className="meta-value">{doc?.filename ?? "--"}</span>
-            </div>
-            <div className="meta-row">
-              <span className="meta-key">doc_id</span>
-              <span className="meta-value">{doc?.doc_id ?? "--"}</span>
-            </div>
-            <div className="meta-row">
-              <span className="meta-key">Indexed chunks</span>
-              <span className="meta-value">{indexed ? `${indexed.upserted_count}` : "--"}</span>
-            </div>
+        {indexed && (
+          <div className="insight-nav" role="tablist" aria-label="Insight modules">
+            {INSIGHT_TABS.map((tab) => (
+              <button
+                key={tab.moduleId}
+                type="button"
+                className={`insight-tab ${selectedInsightId === tab.moduleId ? "active" : ""}`}
+                onClick={() => setActiveInsightId(tab.moduleId)}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
-        </section>
+        )}
 
-        <div className="workflow-main">
-          <section className="surface-card">
-            <div className="section-heading">
-              <div>
-                <p className="step-kicker">Step 2</p>
-                <h2>Automatic insights dashboard</h2>
-              </div>
-              <span className={statusClassName(insightsStatus.tone)}>{insightsStatus.label}</span>
-            </div>
+        {!indexed && <div className="empty-state">Upload and index a document to generate your executive brief.</div>}
 
-            <p className="section-copy">
-              After indexing, business insight modules are generated automatically using document-scoped retrieval.
-            </p>
+        {busy === "insights" && (
+          <div className="empty-state">
+            Building your diagnosis: loss leakage, cost pressure, risk, margin opportunities, and trend signals.
+          </div>
+        )}
 
-            {indexed && (
-              <div className="dashboard-actions">
-                <button
-                  className="secondary-btn"
-                  disabled={!canRegenerateInsights}
-                  onClick={() => fetchInsights(indexed.doc_id)}
-                >
-                  {busy === "insights" ? "Generating insights..." : "Regenerate insights"}
-                </button>
-              </div>
-            )}
+        {indexed && !busy && !selectedInsight && (
+          <div className="empty-state">No insight data yet. Regenerate the brief after indexing finishes.</div>
+        )}
 
-            {!indexed && <p className="helper-note">Upload and index a document to generate insights automatically.</p>}
-
-            {busy === "insights" && (
-              <div className="empty-state">
-                Generating insight modules: where losses occur, cost drivers, risks, margin opportunities, and anomalies.
-              </div>
-            )}
-
-            {indexed && !busy && insights.length === 0 && (
-              <div className="empty-state">
-                No insight modules yet. Use <strong>Regenerate insights</strong> to run diagnostics for this document.
-              </div>
-            )}
-
-            {insights.length > 0 && (
-              <>
-                <div className="insights-summary-row">
-                  <div className="insights-summary-card">
-                    <span>Modules</span>
-                    <strong>{insightsMeta?.moduleCount ?? insights.length}</strong>
-                  </div>
-                  <div className="insights-summary-card">
-                    <span>Successful</span>
-                    <strong>{insightsMeta?.successfulModules ?? insightsCoverage.ok}</strong>
-                  </div>
-                  <div className="insights-summary-card">
-                    <span>Fallbacks</span>
-                    <strong>{insightsCoverage.fallback}</strong>
-                  </div>
-                </div>
-
-                {insights.map((module) => {
-                  const moduleCitationOrder = buildCitationOrder(module.citations ?? []);
-                  const moduleMatchesBySource = new Map<string, RetrievalMatch>();
-                  (module.matches ?? []).forEach((match) => moduleMatchesBySource.set(match.id, match));
-
-                  return (
-                    <article key={module.module_id} className="insight-card module-card">
-                      <div className="insight-card-header">
-                        <h4>{module.title}</h4>
-                        <span className={`module-status ${module.status}`}>{formatModuleStatus(module.status)}</span>
-                      </div>
-
-                      <p className="insight-direct-answer">
-                        {renderTextWithCitationChips(module.direct_answer || module.summary, moduleCitationOrder)}
-                      </p>
-
-                      <div className="insight-grid">
-                        <section className="insight-section findings">
-                          <h5>Key findings</h5>
-                          <ul>
-                            {(module.key_findings ?? []).map((finding, index) => (
-                              <li key={index}>{renderTextWithCitationChips(finding, moduleCitationOrder)}</li>
-                            ))}
-                          </ul>
-                        </section>
-
-                        <section className="insight-section actions">
-                          <h5>Recommended actions</h5>
-                          <ul>
-                            {(module.recommended_actions ?? []).map((action, index) => (
-                              <li key={index}>{action}</li>
-                            ))}
-                          </ul>
-                        </section>
-                      </div>
-
-                      {module.error && <p className="module-error">Module note: {module.error}</p>}
-
-                      {(module.citations ?? []).length > 0 && (
-                        <div className="module-citations">
-                          <h5 className="module-citations-title">Citations ({module.citations.length})</h5>
-                          <div className="sources-list">
-                            {module.citations.map((citation, index) => {
-                              const match = moduleMatchesBySource.get(citation.source_id);
-                              const confidence = confidenceBand(citation.score);
-                              const docLabel = citation.doc_id ? citation.doc_id.slice(0, 8) : "unknown";
-                              const chunkLabel = citation.chunk_id ?? "?";
-                              const start = citation.start ?? "-";
-                              const end = citation.end ?? "-";
-                              const score = typeof citation.score === "number" ? citation.score.toFixed(3) : "--";
-
-                              return (
-                                <details key={`${module.module_id}-${citation.source_id}`} className="source-card">
-                                  <summary>
-                                    <span className="source-rank">[{index + 1}]</span>
-                                    <div className="source-summary-main">
-                                      <span className="source-id">
-                                        {docLabel}...:{chunkLabel}
-                                      </span>
-                                      <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
-                                    </div>
-                                    <span className="source-range">
-                                      score {score} • chars {start}-{end}
-                                    </span>
-                                  </summary>
-                                  {match?.text && <p className="source-excerpt">{match.text}</p>}
-                                  <div className="source-note">
-                                    Source ID: <code>{citation.source_id}</code>
-                                  </div>
-                                </details>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </article>
-                  );
-                })}
-              </>
-            )}
-          </section>
-
-          <section className="surface-card">
-            <div className="section-heading">
-              <div>
-                <p className="step-kicker">Step 3</p>
-                <h2>Ask and review answer</h2>
-              </div>
-              <span className={statusClassName(askStatus.tone)}>{askStatus.label}</span>
-            </div>
-
-            <p className="section-copy">You can still ask follow-up questions against the same indexed document.</p>
-
-            <div className="ask-row">
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Ask a follow-up question about your document..."
-                className="query-input"
-              />
-              <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
-                {busy === "ask" ? "Asking..." : "Ask"}
+        {selectedInsight && (
+          <article className="brief-focus">
+            <div className="brief-head">
+              <h3 className="brief-title">{selectedInsight.title}</h3>
+              <button className="secondary-btn" disabled={!canRegenerateInsights} onClick={() => fetchInsights(indexed!.doc_id)}>
+                Regenerate
               </button>
             </div>
 
-            {!indexed && <p className="helper-note">Upload and index a file to enable Ask.</p>}
+            {statusHintForInsight(selectedInsight.status) && (
+              <p className="brief-status-note">{statusHintForInsight(selectedInsight.status)}</p>
+            )}
 
-            <div className="answer-panel">
-              <div className="response-module-header">
-                <h3>Response</h3>
-                <span className={`response-state ${hasAssistantAnswer ? "ready" : "idle"}`}>
-                  {hasAssistantAnswer ? "Grounded answer" : "Waiting for question"}
-                </span>
-              </div>
-              <p className="response-copy">Ask remains available for deeper investigation after auto-insights.</p>
+            <section className="brief-section">
+              <h4>Direct answer</h4>
+              <p className="brief-direct">
+                {renderTextWithCitationChips(
+                  selectedInsight.direct_answer || selectedInsight.summary,
+                  selectedCitationOrder
+                )}
+              </p>
+            </section>
 
-              {latestQuestion === "" ? (
-                <div className="empty-state">Your conversation appears here after you ask a question.</div>
+            <section className="brief-section">
+              <h4>Key findings</h4>
+              <ul className="brief-findings">
+                {selectedInsight.key_findings.map((finding, index) => (
+                  <li key={index}>{renderTextWithCitationChips(finding, selectedCitationOrder)}</li>
+                ))}
+              </ul>
+            </section>
+
+            <section className="brief-section brief-actions-wrap">
+              <h4>Recommended actions</h4>
+              <ul className="brief-actions">
+                {selectedInsight.recommended_actions.map((action, index) => (
+                  <li key={index}>{cleanExecutiveActionText(action)}</li>
+                ))}
+              </ul>
+            </section>
+
+            <section className="brief-section">
+              <h4>Sources</h4>
+              {selectedInsight.citations.length === 0 ? (
+                <p className="sources-empty">No source excerpts were available for this section.</p>
               ) : (
-                <div className="brief-shell">
-                  <div className="question-brief">
-                    <span className="question-brief-label">Question</span>
-                    <p>{latestQuestion}</p>
-                  </div>
-
-                  {latestAssistantMessage && (
-                    <article className="insight-card">
-                      <div className="insight-card-header">
-                        <h4>Direct answer</h4>
-                        {answerMode && (
-                          <span className={`answer-mode-chip ${answerMode}`}>
-                            {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
-                          </span>
-                        )}
-                      </div>
-
-                      <p className="insight-direct-answer">
-                        {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
-                      </p>
-
-                      <div className="insight-grid">
-                        <section className="insight-section findings">
-                          <h5>Key findings</h5>
-                          <ul>
-                            {insightBrief.keyFindings.map((finding, index) => (
-                              <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
-                            ))}
-                          </ul>
-                        </section>
-
-                        <section className="insight-section actions">
-                          <h5>Recommended next actions</h5>
-                          <ul>
-                            {insightBrief.recommendedActions.map((action, index) => (
-                              <li key={index}>{action}</li>
-                            ))}
-                          </ul>
-                        </section>
-                      </div>
-                    </article>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {citations.length > 0 && (
-              <div className="sources-block">
-                <h3>Supporting sources ({citations.length})</h3>
-                <p className="sources-copy">Ranked evidence that grounds the answer and enables quick verification.</p>
-
-                <div className="sources-list">
-                  {citations.map((citation, index) => {
-                    const match = matchesBySource.get(citation.source_id);
-                    const confidence = confidenceBand(citation.score);
-                    const docLabel = citation.doc_id ? citation.doc_id.slice(0, 8) : "unknown";
-                    const chunkLabel = citation.chunk_id ?? "?";
-                    const start = citation.start ?? "-";
-                    const end = citation.end ?? "-";
-                    const score = typeof citation.score === "number" ? citation.score.toFixed(3) : "--";
+                <div className="brief-sources">
+                  {selectedInsight.citations.map((citation, index) => {
+                    const match = selectedMatchesBySource.get(citation.source_id);
 
                     return (
-                      <details key={citation.source_id} className="source-card">
+                      <details key={`${selectedInsight.module_id}-${citation.source_id}`} className="source-card compact-source">
                         <summary>
                           <span className="source-rank">[{index + 1}]</span>
                           <div className="source-summary-main">
-                            <span className="source-id">
-                              {docLabel}...:{chunkLabel}
-                            </span>
-                            <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
+                            <span className="source-id">Source excerpt {index + 1}</span>
                           </div>
-                          <span className="source-range">
-                            score {score} • chars {start}-{end}
-                          </span>
                         </summary>
                         {match?.text && <p className="source-excerpt">{match.text}</p>}
-                        <div className="source-note">
-                          Source ID: <code>{citation.source_id}</code>
-                        </div>
                       </details>
                     );
                   })}
                 </div>
-              </div>
-            )}
-          </section>
+              )}
+            </section>
+          </article>
+        )}
+      </section>
+
+      <section className="surface-card ask-card">
+        <div className="surface-heading">
+          <h2>Follow-up Q&A</h2>
+          <p className="section-copy">Ask targeted questions against the same document when you need deeper detail.</p>
         </div>
-      </div>
+
+        <div className="ask-row">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Ask a follow-up question..."
+            className="query-input"
+          />
+          <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
+            {busy === "ask" ? "Asking..." : "Ask"}
+          </button>
+        </div>
+
+        {!indexed && <p className="helper-note">Upload and index a document to enable follow-up Q&A.</p>}
+
+        <div className="answer-panel ask-answer-panel">
+          {latestQuestion === "" ? (
+            <div className="empty-state">Your follow-up response appears here.</div>
+          ) : (
+            <div className="brief-shell">
+              <div className="question-brief">
+                <span className="question-brief-label">Question</span>
+                <p>{latestQuestion}</p>
+              </div>
+
+              {latestAssistantMessage && (
+                <article className="insight-card">
+                  <div className="insight-card-header">
+                    <h4>Answer</h4>
+                    {answerMode && (
+                      <span className={`answer-mode-chip ${answerMode}`}>
+                        {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
+                      </span>
+                    )}
+                  </div>
+
+                  <p className="insight-direct-answer">
+                    {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
+                  </p>
+
+                  <div className="insight-grid">
+                    <section className="insight-section findings">
+                      <h5>Key findings</h5>
+                      <ul>
+                        {insightBrief.keyFindings.map((finding, index) => (
+                          <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
+                        ))}
+                      </ul>
+                    </section>
+
+                    <section className="insight-section actions">
+                      <h5>Recommended actions</h5>
+                      <ul>
+                        {insightBrief.recommendedActions.map((action, index) => (
+                          <li key={index}>{action}</li>
+                        ))}
+                      </ul>
+                    </section>
+                  </div>
+                </article>
+              )}
+            </div>
+          )}
+        </div>
+
+        {citations.length > 0 && (
+          <div className="sources-block">
+            <h3>Supporting sources ({citations.length})</h3>
+            <div className="sources-list">
+              {citations.map((citation, index) => {
+                const match = matchesBySource.get(citation.source_id);
+
+                return (
+                  <details key={citation.source_id} className="source-card compact-source">
+                    <summary>
+                      <span className="source-rank">[{index + 1}]</span>
+                      <div className="source-summary-main">
+                        <span className="source-id">Source excerpt {index + 1}</span>
+                      </div>
+                    </summary>
+                    {match?.text && <p className="source-excerpt">{match.text}</p>}
+                  </details>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </section>
 
       {err && (
         <div className="error-banner">
