@@ -24,11 +24,23 @@ type IndexResp = {
 
 type Citation = {
   source_id: string;
-  doc_id: string;
-  chunk_id: string;
-  start: number;
-  end: number;
-  score: number;
+  doc_id?: string | null;
+  chunk_id?: string | null;
+  start?: number | null;
+  end?: number | null;
+  score?: number | null;
+};
+
+type RetrievalMatch = {
+  id: string;
+  score?: number;
+  text: string;
+  metadata?: {
+    doc_id?: string;
+    chunk_id?: string;
+    start?: number;
+    end?: number;
+  };
 };
 
 type AskResp = {
@@ -49,19 +61,32 @@ type AskResp = {
   message?: string;
 };
 
-type ChatMessage = { role: "user" | "assistant"; text: string };
+type InsightModuleStatus = "ok" | "fallback" | "failed" | "insufficient_evidence";
 
-type RetrievalMatch = {
-  id: string;
-  score: number;
-  text: string;
-  metadata?: {
-    doc_id?: string;
-    chunk_id?: string;
-    start?: number;
-    end?: number;
-  };
+type InsightModule = {
+  module_id: string;
+  title: string;
+  status: InsightModuleStatus;
+  summary: string;
+  direct_answer: string;
+  key_findings: string[];
+  recommended_actions: string[];
+  citations: Citation[];
+  matches: RetrievalMatch[];
+  error?: string;
 };
+
+type InsightsResp = {
+  ok: boolean;
+  doc_id: string;
+  tenant_id: string;
+  request_id: string;
+  module_count: number;
+  successful_modules: number;
+  modules: InsightModule[];
+};
+
+type ChatMessage = { role: "user" | "assistant"; text: string };
 
 type InsightBrief = {
   directAnswer: string;
@@ -231,14 +256,45 @@ function renderTextWithCitationChips(text: string, citationOrder: Map<string, nu
     });
 }
 
-function confidenceBand(score: number) {
+function confidenceBand(score: number | null | undefined) {
+  if (typeof score !== "number") return { label: "No score", tone: "low" as const };
   if (score >= 0.75) return { label: "High confidence", tone: "high" as const };
   if (score >= 0.55) return { label: "Medium confidence", tone: "medium" as const };
   return { label: "Low confidence", tone: "low" as const };
 }
 
+function formatModuleStatus(status: InsightModuleStatus): string {
+  if (status === "ok") return "Ready";
+  if (status === "fallback") return "Fallback";
+  if (status === "insufficient_evidence") return "Limited evidence";
+  return "Failed";
+}
+
+function buildCitationOrder(citations: Citation[]): Map<string, number> {
+  const lookup = new Map<string, number>();
+  citations.forEach((citation, index) => {
+    lookup.set(normalizeCitationToken(citation.source_id), index + 1);
+    if (citation.doc_id && citation.chunk_id) {
+      lookup.set(normalizeCitationToken(`${citation.doc_id}:${citation.chunk_id}`), index + 1);
+    }
+  });
+  return lookup;
+}
+
+function scoreInsightCoverage(modules: InsightModule[]) {
+  return modules.reduce(
+    (acc, module) => {
+      if (module.status === "ok") acc.ok += 1;
+      if (module.status === "fallback") acc.fallback += 1;
+      if (module.status === "insufficient_evidence") acc.insufficient += 1;
+      if (module.status === "failed") acc.failed += 1;
+      return acc;
+    },
+    { ok: 0, fallback: 0, insufficient: 0, failed: 0 }
+  );
+}
+
 export default function Home() {
-  // demo tenant is fixed for non-technical demos
   const tenantId = "demo-tenant";
 
   const [requestId, setRequestId] = useState(makeRequestId());
@@ -246,6 +302,8 @@ export default function Home() {
 
   const [doc, setDoc] = useState<UploadResp | null>(null);
   const [indexed, setIndexed] = useState<IndexResp | null>(null);
+  const [insights, setInsights] = useState<InsightModule[]>([]);
+  const [insightsMeta, setInsightsMeta] = useState<{ moduleCount: number; successfulModules: number } | null>(null);
 
   const [query, setQuery] = useState("");
   const [chat, setChat] = useState<ChatMessage[]>([]);
@@ -253,7 +311,7 @@ export default function Home() {
   const [sourceMatches, setSourceMatches] = useState<RetrievalMatch[]>([]);
   const [briefFromServer, setBriefFromServer] = useState<AskResp["brief"]>();
   const [answerMode, setAnswerMode] = useState<AskResp["answer_mode"] | null>(null);
-  const [busy, setBusy] = useState<null | "upload" | "ask">(null);
+  const [busy, setBusy] = useState<null | "upload" | "insights" | "ask">(null);
   const [err, setErr] = useState<string | null>(null);
 
   const headers = useMemo(
@@ -265,19 +323,13 @@ export default function Home() {
   );
 
   const canUpload = Boolean(file) && busy === null;
+  const canRegenerateInsights = Boolean(indexed) && busy === null;
   const canAsk = Boolean(indexed) && busy === null && query.trim().length > 0;
   const hasAssistantAnswer = chat.some((entry) => entry.role === "assistant");
   const latestQuestion = [...chat].reverse().find((entry) => entry.role === "user")?.text ?? "";
   const latestAssistantMessage = [...chat].reverse().find((entry) => entry.role === "assistant")?.text ?? "";
 
-  const citationOrder = useMemo(() => {
-    const lookup = new Map<string, number>();
-    citations.forEach((citation, index) => {
-      lookup.set(normalizeCitationToken(citation.source_id), index + 1);
-      lookup.set(normalizeCitationToken(`${citation.doc_id}:${citation.chunk_id}`), index + 1);
-    });
-    return lookup;
-  }, [citations]);
+  const citationOrder = useMemo(() => buildCitationOrder(citations), [citations]);
 
   const matchesBySource = useMemo(() => {
     const lookup = new Map<string, RetrievalMatch>();
@@ -287,10 +339,33 @@ export default function Home() {
     return lookup;
   }, [sourceMatches]);
 
+  const insightsCoverage = useMemo(() => scoreInsightCoverage(insights), [insights]);
+
   const insightBrief = useMemo(
     () => buildInsightBrief(latestAssistantMessage, latestQuestion, briefFromServer),
     [latestAssistantMessage, latestQuestion, briefFromServer]
   );
+
+  async function fetchInsights(docId: string, clearOldInsights = false) {
+    if (clearOldInsights) {
+      setInsights([]);
+      setInsightsMeta(null);
+    }
+
+    setBusy("insights");
+    try {
+      const resp = (await postJson("/v1/insights", { doc_id: docId, top_k: 4 }, headers)) as InsightsResp;
+      setInsights(resp.modules ?? []);
+      setInsightsMeta({
+        moduleCount: resp.module_count ?? (resp.modules?.length ?? 0),
+        successfulModules: resp.successful_modules ?? 0,
+      });
+    } catch (e: unknown) {
+      setErr(asErrorMessage(e, "Insights generation failed"));
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function uploadAndIndex() {
     if (!file) return;
@@ -298,27 +373,32 @@ export default function Home() {
     setBusy("upload");
 
     try {
-      // 1) Upload
       const form = new FormData();
       form.append("file", file);
       const up = (await postForm("/v1/docs/upload", form, headers)) as UploadResp;
       setDoc(up);
 
-      // 2) Index (hardcoded chunking — NOT user-controlled)
       const CHUNK_SIZE = 700;
       const OVERLAP = 80;
-
       const idx = (await postJson(
         `/v1/docs/${up.doc_id}/index?chunk_size=${CHUNK_SIZE}&overlap=${OVERLAP}`,
         {},
         headers
       )) as IndexResp;
-
       setIndexed(idx);
-    } catch (e: unknown) {
-      setErr(asErrorMessage(e, "Upload/index failed"));
-    } finally {
+
+      setQuery("");
+      setChat([]);
+      setCitations([]);
+      setSourceMatches([]);
+      setBriefFromServer(undefined);
+      setAnswerMode(null);
+
       setBusy(null);
+      await fetchInsights(up.doc_id, true);
+    } catch (e: unknown) {
+      setBusy(null);
+      setErr(asErrorMessage(e, "Upload/index failed"));
     }
   }
 
@@ -335,8 +415,6 @@ export default function Home() {
     setBusy("ask");
     setAnswerMode(null);
     setBriefFromServer(undefined);
-
-    // Show the user question immediately
     setChat((c) => [...c, { role: "user", text: trimmedQuery }]);
 
     try {
@@ -379,6 +457,15 @@ export default function Home() {
           ? { label: "Ready", tone: "ready" as const }
           : { label: "Awaiting file", tone: "idle" as const };
 
+  const insightsStatus =
+    busy === "insights"
+      ? { label: "Diagnosing", tone: "working" as const }
+      : insights.length > 0
+        ? { label: "Ready", tone: "complete" as const }
+        : indexed
+          ? { label: "Queued", tone: "ready" as const }
+          : { label: "Upload first", tone: "idle" as const };
+
   const askStatus =
     busy === "ask"
       ? { label: "Generating answer", tone: "working" as const }
@@ -394,7 +481,7 @@ export default function Home() {
         <p className="hero-kicker">Product Demo</p>
         <h1>Apalym</h1>
         <p className="hero-subtitle">
-          Upload a PDF, CSV, or XLSX file, ask a question, and verify every answer with scored source citations.
+          Upload once, then get an automatic business diagnosis dashboard grounded in citations from your document.
         </p>
 
         <div className="meta-strip">
@@ -423,7 +510,7 @@ export default function Home() {
           </div>
 
           <p className="section-copy">
-            Choose a PDF, CSV, or XLSX file. We apply stable indexing defaults automatically, with no setup required.
+            Choose a PDF, CSV, or XLSX file. The app uploads and indexes it automatically with stable defaults.
           </p>
 
           <label className="file-input-wrap">
@@ -462,128 +549,269 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="surface-card">
-          <div className="section-heading">
-            <div>
-              <p className="step-kicker">Step 2</p>
-              <h2>Ask and review answer</h2>
+        <div className="workflow-main">
+          <section className="surface-card">
+            <div className="section-heading">
+              <div>
+                <p className="step-kicker">Step 2</p>
+                <h2>Automatic insights dashboard</h2>
+              </div>
+              <span className={statusClassName(insightsStatus.tone)}>{insightsStatus.label}</span>
             </div>
-            <span className={statusClassName(askStatus.tone)}>{askStatus.label}</span>
-          </div>
 
-          <p className="section-copy">Ask a question grounded in the uploaded document data.</p>
-
-          <div className="ask-row">
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask a question about your PDF, CSV, or XLSX..."
-              className="query-input"
-            />
-            <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
-              {busy === "ask" ? "Asking..." : "Ask"}
-            </button>
-          </div>
-
-          {!indexed && <p className="helper-note">Upload and index a PDF, CSV, or XLSX file to enable Ask.</p>}
-
-          <div className="answer-panel">
-            <div className="response-module-header">
-              <h3>Response</h3>
-              <span className={`response-state ${hasAssistantAnswer ? "ready" : "idle"}`}>
-                {hasAssistantAnswer ? "Grounded answer" : "Waiting for question"}
-              </span>
-            </div>
-            <p className="response-copy">
-              Answers are generated from indexed chunks and paired with scored source references.
+            <p className="section-copy">
+              After indexing, business insight modules are generated automatically using document-scoped retrieval.
             </p>
 
-            {latestQuestion === "" ? (
-              <div className="empty-state">
-                Your conversation appears here after you ask a question.
-              </div>
-            ) : (
-              <div className="brief-shell">
-                <div className="question-brief">
-                  <span className="question-brief-label">Question</span>
-                  <p>{latestQuestion}</p>
-                </div>
-
-                {latestAssistantMessage && (
-                  <article className="insight-card">
-                    <div className="insight-card-header">
-                      <h4>Direct answer</h4>
-                      {answerMode && (
-                        <span className={`answer-mode-chip ${answerMode}`}>
-                          {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
-                        </span>
-                      )}
-                    </div>
-
-                    <p className="insight-direct-answer">
-                      {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
-                    </p>
-
-                    <div className="insight-grid">
-                      <section className="insight-section findings">
-                        <h5>Key findings</h5>
-                        <ul>
-                          {insightBrief.keyFindings.map((finding, index) => (
-                            <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
-                          ))}
-                        </ul>
-                      </section>
-
-                      <section className="insight-section actions">
-                        <h5>Recommended next actions</h5>
-                        <ul>
-                          {insightBrief.recommendedActions.map((action, index) => (
-                            <li key={index}>{action}</li>
-                          ))}
-                        </ul>
-                      </section>
-                    </div>
-                  </article>
-                )}
+            {indexed && (
+              <div className="dashboard-actions">
+                <button
+                  className="secondary-btn"
+                  disabled={!canRegenerateInsights}
+                  onClick={() => fetchInsights(indexed.doc_id)}
+                >
+                  {busy === "insights" ? "Generating insights..." : "Regenerate insights"}
+                </button>
               </div>
             )}
-          </div>
 
-          {citations.length > 0 && (
-            <div className="sources-block">
-              <h3>Supporting sources ({citations.length})</h3>
-              <p className="sources-copy">Ranked evidence that grounds the answer and enables quick verification.</p>
+            {!indexed && <p className="helper-note">Upload and index a document to generate insights automatically.</p>}
 
-              <div className="sources-list">
-                {citations.map((citation, index) => {
-                  const match = matchesBySource.get(citation.source_id);
-                  const confidence = confidenceBand(citation.score);
+            {busy === "insights" && (
+              <div className="empty-state">
+                Generating insight modules: where losses occur, cost drivers, risks, margin opportunities, and anomalies.
+              </div>
+            )}
+
+            {indexed && !busy && insights.length === 0 && (
+              <div className="empty-state">
+                No insight modules yet. Use <strong>Regenerate insights</strong> to run diagnostics for this document.
+              </div>
+            )}
+
+            {insights.length > 0 && (
+              <>
+                <div className="insights-summary-row">
+                  <div className="insights-summary-card">
+                    <span>Modules</span>
+                    <strong>{insightsMeta?.moduleCount ?? insights.length}</strong>
+                  </div>
+                  <div className="insights-summary-card">
+                    <span>Successful</span>
+                    <strong>{insightsMeta?.successfulModules ?? insightsCoverage.ok}</strong>
+                  </div>
+                  <div className="insights-summary-card">
+                    <span>Fallbacks</span>
+                    <strong>{insightsCoverage.fallback}</strong>
+                  </div>
+                </div>
+
+                {insights.map((module) => {
+                  const moduleCitationOrder = buildCitationOrder(module.citations ?? []);
+                  const moduleMatchesBySource = new Map<string, RetrievalMatch>();
+                  (module.matches ?? []).forEach((match) => moduleMatchesBySource.set(match.id, match));
 
                   return (
-                    <details key={citation.source_id} className="source-card">
-                      <summary>
-                        <span className="source-rank">[{index + 1}]</span>
-                        <div className="source-summary-main">
-                          <span className="source-id">
-                            {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
-                          </span>
-                          <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
-                        </div>
-                        <span className="source-range">
-                          score {citation.score.toFixed(3)} • chars {citation.start}-{citation.end}
-                        </span>
-                      </summary>
-                      {match?.text && <p className="source-excerpt">{match.text}</p>}
-                      <div className="source-note">
-                        Source ID: <code>{citation.source_id}</code>
+                    <article key={module.module_id} className="insight-card module-card">
+                      <div className="insight-card-header">
+                        <h4>{module.title}</h4>
+                        <span className={`module-status ${module.status}`}>{formatModuleStatus(module.status)}</span>
                       </div>
-                    </details>
+
+                      <p className="insight-direct-answer">
+                        {renderTextWithCitationChips(module.direct_answer || module.summary, moduleCitationOrder)}
+                      </p>
+
+                      <div className="insight-grid">
+                        <section className="insight-section findings">
+                          <h5>Key findings</h5>
+                          <ul>
+                            {(module.key_findings ?? []).map((finding, index) => (
+                              <li key={index}>{renderTextWithCitationChips(finding, moduleCitationOrder)}</li>
+                            ))}
+                          </ul>
+                        </section>
+
+                        <section className="insight-section actions">
+                          <h5>Recommended actions</h5>
+                          <ul>
+                            {(module.recommended_actions ?? []).map((action, index) => (
+                              <li key={index}>{action}</li>
+                            ))}
+                          </ul>
+                        </section>
+                      </div>
+
+                      {module.error && <p className="module-error">Module note: {module.error}</p>}
+
+                      {(module.citations ?? []).length > 0 && (
+                        <div className="module-citations">
+                          <h5 className="module-citations-title">Citations ({module.citations.length})</h5>
+                          <div className="sources-list">
+                            {module.citations.map((citation, index) => {
+                              const match = moduleMatchesBySource.get(citation.source_id);
+                              const confidence = confidenceBand(citation.score);
+                              const docLabel = citation.doc_id ? citation.doc_id.slice(0, 8) : "unknown";
+                              const chunkLabel = citation.chunk_id ?? "?";
+                              const start = citation.start ?? "-";
+                              const end = citation.end ?? "-";
+                              const score = typeof citation.score === "number" ? citation.score.toFixed(3) : "--";
+
+                              return (
+                                <details key={`${module.module_id}-${citation.source_id}`} className="source-card">
+                                  <summary>
+                                    <span className="source-rank">[{index + 1}]</span>
+                                    <div className="source-summary-main">
+                                      <span className="source-id">
+                                        {docLabel}...:{chunkLabel}
+                                      </span>
+                                      <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
+                                    </div>
+                                    <span className="source-range">
+                                      score {score} • chars {start}-{end}
+                                    </span>
+                                  </summary>
+                                  {match?.text && <p className="source-excerpt">{match.text}</p>}
+                                  <div className="source-note">
+                                    Source ID: <code>{citation.source_id}</code>
+                                  </div>
+                                </details>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </article>
                   );
                 })}
+              </>
+            )}
+          </section>
+
+          <section className="surface-card">
+            <div className="section-heading">
+              <div>
+                <p className="step-kicker">Step 3</p>
+                <h2>Ask and review answer</h2>
               </div>
+              <span className={statusClassName(askStatus.tone)}>{askStatus.label}</span>
             </div>
-          )}
-        </section>
+
+            <p className="section-copy">You can still ask follow-up questions against the same indexed document.</p>
+
+            <div className="ask-row">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Ask a follow-up question about your document..."
+                className="query-input"
+              />
+              <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
+                {busy === "ask" ? "Asking..." : "Ask"}
+              </button>
+            </div>
+
+            {!indexed && <p className="helper-note">Upload and index a file to enable Ask.</p>}
+
+            <div className="answer-panel">
+              <div className="response-module-header">
+                <h3>Response</h3>
+                <span className={`response-state ${hasAssistantAnswer ? "ready" : "idle"}`}>
+                  {hasAssistantAnswer ? "Grounded answer" : "Waiting for question"}
+                </span>
+              </div>
+              <p className="response-copy">Ask remains available for deeper investigation after auto-insights.</p>
+
+              {latestQuestion === "" ? (
+                <div className="empty-state">Your conversation appears here after you ask a question.</div>
+              ) : (
+                <div className="brief-shell">
+                  <div className="question-brief">
+                    <span className="question-brief-label">Question</span>
+                    <p>{latestQuestion}</p>
+                  </div>
+
+                  {latestAssistantMessage && (
+                    <article className="insight-card">
+                      <div className="insight-card-header">
+                        <h4>Direct answer</h4>
+                        {answerMode && (
+                          <span className={`answer-mode-chip ${answerMode}`}>
+                            {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="insight-direct-answer">
+                        {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
+                      </p>
+
+                      <div className="insight-grid">
+                        <section className="insight-section findings">
+                          <h5>Key findings</h5>
+                          <ul>
+                            {insightBrief.keyFindings.map((finding, index) => (
+                              <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
+                            ))}
+                          </ul>
+                        </section>
+
+                        <section className="insight-section actions">
+                          <h5>Recommended next actions</h5>
+                          <ul>
+                            {insightBrief.recommendedActions.map((action, index) => (
+                              <li key={index}>{action}</li>
+                            ))}
+                          </ul>
+                        </section>
+                      </div>
+                    </article>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {citations.length > 0 && (
+              <div className="sources-block">
+                <h3>Supporting sources ({citations.length})</h3>
+                <p className="sources-copy">Ranked evidence that grounds the answer and enables quick verification.</p>
+
+                <div className="sources-list">
+                  {citations.map((citation, index) => {
+                    const match = matchesBySource.get(citation.source_id);
+                    const confidence = confidenceBand(citation.score);
+                    const docLabel = citation.doc_id ? citation.doc_id.slice(0, 8) : "unknown";
+                    const chunkLabel = citation.chunk_id ?? "?";
+                    const start = citation.start ?? "-";
+                    const end = citation.end ?? "-";
+                    const score = typeof citation.score === "number" ? citation.score.toFixed(3) : "--";
+
+                    return (
+                      <details key={citation.source_id} className="source-card">
+                        <summary>
+                          <span className="source-rank">[{index + 1}]</span>
+                          <div className="source-summary-main">
+                            <span className="source-id">
+                              {docLabel}...:{chunkLabel}
+                            </span>
+                            <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
+                          </div>
+                          <span className="source-range">
+                            score {score} • chars {start}-{end}
+                          </span>
+                        </summary>
+                        {match?.text && <p className="source-excerpt">{match.text}</p>}
+                        <div className="source-note">
+                          Source ID: <code>{citation.source_id}</code>
+                        </div>
+                      </details>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
       </div>
 
       {err && (
