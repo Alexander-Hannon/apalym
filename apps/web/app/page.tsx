@@ -1,6 +1,6 @@
 "use client";
 
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useMemo, useRef, useState } from "react";
 import { postForm, postJson } from "./lib/api";
 
 type UploadResp = {
@@ -94,13 +94,21 @@ type InsightBrief = {
   recommendedActions: string[];
 };
 
-const INSIGHT_TABS = [
-  { moduleId: "loss-leakage", label: "Loss" },
-  { moduleId: "top-cost-drivers", label: "Costs" },
-  { moduleId: "key-risks", label: "Risks" },
-  { moduleId: "margin-opportunities", label: "Margins" },
-  { moduleId: "trends-anomalies", label: "Trends" },
-] as const;
+type InsightTab = {
+  moduleId: string;
+  navLabel: string;
+  sidebarLabel: string;
+  icon: string;
+  tone: "losses" | "costs" | "risks" | "margins" | "trends";
+};
+
+const INSIGHT_TABS: InsightTab[] = [
+  { moduleId: "loss-leakage", navLabel: "Losses", sidebarLabel: "Losses", icon: "📉", tone: "losses" },
+  { moduleId: "top-cost-drivers", navLabel: "Costs", sidebarLabel: "Costs", icon: "📊", tone: "costs" },
+  { moduleId: "key-risks", navLabel: "Risks", sidebarLabel: "Risks", icon: "⚠️", tone: "risks" },
+  { moduleId: "margin-opportunities", navLabel: "Margins", sidebarLabel: "Margins", icon: "📈", tone: "margins" },
+  { moduleId: "trends-anomalies", navLabel: "Trends", sidebarLabel: "Trends", icon: "🪄", tone: "trends" },
+];
 
 function makeRequestId() {
   return `WEB-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -132,7 +140,6 @@ function splitCitationCandidates(tagPayload: string): string[] {
 
 function stripRawUuidCitationNoise(text: string): string {
   if (!text) return text;
-  // Remove stray raw UUID citation bundles from model output while keeping prose intact.
   return text
     .replace(/\[[0-9a-f]{8}-[0-9a-f-]{27}(?:\s*,\s*[0-9a-f]{8}-[0-9a-f-]{27})*\]/gi, "")
     .replace(/\s{2,}/g, " ")
@@ -267,7 +274,7 @@ function renderTextWithCitationChips(text: string, citationOrder: Map<string, nu
       if (uniqueOrders.length === 0) return [];
 
       return uniqueOrders.map((order, citationIdx) => (
-        <span key={`tag-${index}-${citationIdx}`} className="inline-citation-chip">
+        <span key={`tag-${index}-${citationIdx}`} className="citation-chip">
           [{order}]
         </span>
       ));
@@ -292,6 +299,27 @@ function statusHintForInsight(status: InsightModuleStatus): string {
   return "This module could not be fully generated for the current run.";
 }
 
+function deriveFileType(filename?: string) {
+  const ext = filename?.split(".").pop()?.toUpperCase();
+  if (!ext) return "DOC";
+  if (["PDF", "CSV", "XLSX"].includes(ext)) return ext;
+  return ext.slice(0, 4);
+}
+
+function deriveGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+function confidenceLabel(score?: number | null) {
+  if (typeof score !== "number") return "Evidence";
+  if (score >= 0.75) return "High confidence";
+  if (score >= 0.55) return "Medium confidence";
+  return "Low confidence";
+}
+
 export default function Home() {
   const tenantId = "demo-tenant";
   const [requestId] = useState(makeRequestId());
@@ -309,6 +337,11 @@ export default function Home() {
   const [answerMode, setAnswerMode] = useState<AskResp["answer_mode"] | null>(null);
   const [busy, setBusy] = useState<null | "upload" | "insights" | "ask">(null);
   const [err, setErr] = useState<string | null>(null);
+
+  const uploadSectionRef = useRef<HTMLElement | null>(null);
+  const briefSectionRef = useRef<HTMLElement | null>(null);
+  const askSectionRef = useRef<HTMLElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const headers = useMemo(
     () => ({
@@ -337,6 +370,7 @@ export default function Home() {
   }, [activeInsightId, insightsById]);
 
   const selectedInsight = insightsById.get(selectedInsightId);
+  const selectedTab = INSIGHT_TABS.find((tab) => tab.moduleId === selectedInsightId) ?? INSIGHT_TABS[0];
 
   const selectedCitationOrder = useMemo(
     () => buildCitationOrder(selectedInsight?.citations ?? []),
@@ -366,7 +400,6 @@ export default function Home() {
 
   async function fetchInsights(docId: string, clearOldInsights = false) {
     if (clearOldInsights) setInsights([]);
-
     setBusy("insights");
     try {
       const resp = (await postJson("/v1/insights", { doc_id: docId, top_k: 4 }, headers)) as InsightsResp;
@@ -399,7 +432,6 @@ export default function Home() {
       setIndexed(idx);
       setActiveInsightId(INSIGHT_TABS[0].moduleId);
       setInsights([]);
-
       setQuery("");
       setChat([]);
       setCitations([]);
@@ -461,204 +493,279 @@ export default function Home() {
     }
   }
 
-  const uploadHint =
+  function openFilePicker() {
+    fileInputRef.current?.click();
+  }
+
+  function jumpToSection(target: "brief" | "ask" | "upload") {
+    if (target === "brief") {
+      briefSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (target === "ask") {
+      askSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    uploadSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function activateInsight(moduleId: string) {
+    setActiveInsightId(moduleId);
+    jumpToSection("brief");
+  }
+
+  const greeting = deriveGreeting();
+  const fileTypeLabel = deriveFileType(doc?.filename ?? file?.name);
+  const uploadStatusLabel =
     busy === "upload"
-      ? "Uploading and indexing your document..."
-      : indexed
-        ? "Document ready for diagnosis."
-        : file
-          ? "File selected. Start diagnosis."
-          : "Choose a document to begin.";
+      ? "Indexing"
+      : busy === "insights"
+        ? "Generating insights"
+        : indexed
+          ? "Ready"
+          : file
+            ? "Selected"
+            : "No document";
+  const headerSubtitle = doc?.filename
+    ? `Here’s your executive brief for ${doc.filename}`
+    : "Upload a business document to generate your executive diagnosis.";
 
   return (
-    <main className="demo-shell executive-shell">
-      <header className="hero-block executive-hero">
-        <h1>Executive Brief</h1>
-        <p className="hero-subtitle">
-          Upload one business document and instantly receive a focused diagnosis with findings, actions, and sources.
-        </p>
-      </header>
-
-      <section className="surface-card upload-card">
-        <div className="surface-heading">
-          <h2>Document upload</h2>
-          <p className="section-copy">PDF, CSV, or XLSX are indexed automatically.</p>
+    <main className="app-shell">
+      <aside className="sidebar">
+        <div className="brand-block">
+          <div className="brand-logo" aria-hidden>
+            ◈
+          </div>
+          <div>
+            <p className="brand-title">Apalym</p>
+            <p className="brand-subtitle">Executive AI</p>
+          </div>
         </div>
 
-        <label className="file-input-wrap">
-          <span className="file-input-label">Document file</span>
+        <nav className="sidebar-nav">
+          <button className="nav-item active" type="button" onClick={() => jumpToSection("brief")}>
+            <span className="nav-icon">✦</span>
+            Executive Brief
+          </button>
+
+          {INSIGHT_TABS.map((tab) => (
+            <button
+              key={tab.moduleId}
+              type="button"
+              className={`nav-item tone-${tab.tone} ${selectedInsightId === tab.moduleId ? "active-soft" : ""}`}
+              onClick={() => activateInsight(tab.moduleId)}
+            >
+              <span className="nav-icon">{tab.icon}</span>
+              {tab.sidebarLabel}
+            </button>
+          ))}
+
+          <button className="nav-item" type="button" onClick={() => jumpToSection("ask")}>
+            <span className="nav-icon">💬</span>
+            Ask Follow-up
+          </button>
+          <button className="nav-item" type="button" onClick={() => jumpToSection("upload")}>
+            <span className="nav-icon">📄</span>
+            Documents
+          </button>
+          <button className="nav-item" type="button">
+            <span className="nav-icon">⚙️</span>
+            Settings
+          </button>
+        </nav>
+      </aside>
+
+      <section className="main-pane">
+        <header className="top-header">
+          <div>
+            <h1>
+              {greeting}, Acme <span aria-hidden>👋</span>
+            </h1>
+            <p>{headerSubtitle}</p>
+          </div>
+          <button type="button" className="header-upload-btn" onClick={openFilePicker}>
+            ⬆ Upload New Document
+          </button>
+        </header>
+
+        <section className="glass-card doc-card" ref={uploadSectionRef}>
+          <div className="doc-card-left">
+            <div className="file-badge">{fileTypeLabel}</div>
+            <div>
+              <p className="doc-name">{doc?.filename ?? file?.name ?? "No document selected"}</p>
+              <p className="doc-meta">
+                {indexed ? "Indexed and diagnosis-ready" : file ? "Ready to index" : "Upload PDF, CSV, or XLSX"}
+              </p>
+            </div>
+          </div>
+          <div className="doc-card-actions">
+            <span className={`status-pill ${indexed ? "ready" : busy === "upload" ? "working" : "idle"}`}>
+              {uploadStatusLabel}
+            </span>
+            <button type="button" className="ghost-btn" onClick={openFilePicker}>
+              Select Document
+            </button>
+            <button type="button" className="primary-btn" onClick={uploadAndIndex} disabled={!canUpload}>
+              {busy === "upload" ? "Uploading..." : "Generate Brief"}
+            </button>
+          </div>
+
           <input
-            className="file-input"
+            ref={fileInputRef}
+            className="hidden-file-input"
             type="file"
             accept="application/pdf,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           />
-        </label>
+        </section>
 
-        {file && (
-          <p className="selected-file">
-            Selected: <strong>{file.name}</strong>
-          </p>
-        )}
-
-        <button onClick={uploadAndIndex} disabled={!canUpload} className="primary-btn full-width">
-          {busy === "upload" ? "Uploading..." : "Upload and diagnose"}
-        </button>
-
-        <p className="status-note">{uploadHint}</p>
-        {doc?.filename && <p className="document-pill">Current document: {doc.filename}</p>}
-      </section>
-
-      <section className="surface-card brief-card">
-        <div className="surface-heading">
-          <h2>Business diagnosis</h2>
-          <p className="section-copy">One insight at a time, tuned for executive review.</p>
-        </div>
-
-        {indexed && (
-          <div className="insight-nav" role="tablist" aria-label="Insight modules">
+        <section className="glass-card brief-card" ref={briefSectionRef}>
+          <div className="brief-nav-shell" role="tablist" aria-label="Insight modules">
             {INSIGHT_TABS.map((tab) => (
               <button
                 key={tab.moduleId}
                 type="button"
-                className={`insight-tab ${selectedInsightId === tab.moduleId ? "active" : ""}`}
+                className={`brief-tab tone-${tab.tone} ${selectedInsightId === tab.moduleId ? "active" : ""}`}
                 onClick={() => setActiveInsightId(tab.moduleId)}
               >
-                {tab.label}
+                <span>{tab.icon}</span>
+                {tab.navLabel}
               </button>
             ))}
           </div>
-        )}
 
-        {!indexed && <div className="empty-state">Upload and index a document to generate your executive brief.</div>}
+          {!indexed && <div className="empty-panel">Upload and index a document to unlock the executive brief.</div>}
 
-        {busy === "insights" && (
-          <div className="empty-state">
-            Building your diagnosis: loss leakage, cost pressure, risk, margin opportunities, and trend signals.
-          </div>
-        )}
-
-        {indexed && !busy && !selectedInsight && (
-          <div className="empty-state">No insight data yet. Regenerate the brief after indexing finishes.</div>
-        )}
-
-        {selectedInsight && (
-          <article className="brief-focus">
-            <div className="brief-head">
-              <h3 className="brief-title">{selectedInsight.title}</h3>
-              <button className="secondary-btn" disabled={!canRegenerateInsights} onClick={() => fetchInsights(indexed!.doc_id)}>
-                Regenerate
-              </button>
+          {busy === "insights" && (
+            <div className="empty-panel">
+              Building your diagnosis modules with document-grounded evidence and citations.
             </div>
+          )}
 
-            {statusHintForInsight(selectedInsight.status) && (
-              <p className="brief-status-note">{statusHintForInsight(selectedInsight.status)}</p>
-            )}
+          {indexed && !busy && !selectedInsight && (
+            <div className="empty-panel">No insights were returned yet. Try regenerating the diagnosis.</div>
+          )}
 
-            <section className="brief-section">
-              <h4>Direct answer</h4>
-              <p className="brief-direct">
-                {renderTextWithCitationChips(
-                  selectedInsight.direct_answer || selectedInsight.summary,
-                  selectedCitationOrder
-                )}
-              </p>
-            </section>
-
-            <section className="brief-section">
-              <h4>Key findings</h4>
-              <ul className="brief-findings">
-                {selectedInsight.key_findings.map((finding, index) => (
-                  <li key={index}>{renderTextWithCitationChips(finding, selectedCitationOrder)}</li>
-                ))}
-              </ul>
-            </section>
-
-            <section className="brief-section brief-actions-wrap">
-              <h4>Recommended actions</h4>
-              <ul className="brief-actions">
-                {selectedInsight.recommended_actions.map((action, index) => (
-                  <li key={index}>{cleanExecutiveActionText(action)}</li>
-                ))}
-              </ul>
-            </section>
-
-            <section className="brief-section">
-              <h4>Sources</h4>
-              {selectedInsight.citations.length === 0 ? (
-                <p className="sources-empty">No source excerpts were available for this section.</p>
-              ) : (
-                <div className="brief-sources">
-                  {selectedInsight.citations.map((citation, index) => {
-                    const match = selectedMatchesBySource.get(citation.source_id);
-
-                    return (
-                      <details key={`${selectedInsight.module_id}-${citation.source_id}`} className="source-card compact-source">
-                        <summary>
-                          <span className="source-rank">[{index + 1}]</span>
-                          <div className="source-summary-main">
-                            <span className="source-id">Source excerpt {index + 1}</span>
-                          </div>
-                        </summary>
-                        {match?.text && <p className="source-excerpt">{match.text}</p>}
-                      </details>
-                    );
-                  })}
+          {selectedInsight && (
+            <>
+              <article className={`insight-hero tone-${selectedTab.tone}`}>
+                <div className="insight-hero-main">
+                  <p className="hero-tag">Primary Insight</p>
+                  <h2>{selectedInsight.title}</h2>
+                  <p>{renderTextWithCitationChips(selectedInsight.direct_answer || selectedInsight.summary, selectedCitationOrder)}</p>
+                  {statusHintForInsight(selectedInsight.status) && (
+                    <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
+                  )}
                 </div>
-              )}
-            </section>
-          </article>
-        )}
-      </section>
+                <div className="hero-visual" aria-hidden>
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              </article>
 
-      <section className="surface-card ask-card">
-        <div className="surface-heading">
-          <h2>Follow-up Q&A</h2>
-          <p className="section-copy">Ask targeted questions against the same document when you need deeper detail.</p>
-        </div>
+              <div className="details-grid">
+                <section className="detail-panel findings-panel">
+                  <h3>Key Findings</h3>
+                  <ul>
+                    {selectedInsight.key_findings.map((finding, index) => (
+                      <li key={index}>{renderTextWithCitationChips(finding, selectedCitationOrder)}</li>
+                    ))}
+                  </ul>
+                </section>
 
-        <div className="ask-row">
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask a follow-up question..."
-            className="query-input"
-          />
-          <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
-            {busy === "ask" ? "Asking..." : "Ask"}
-          </button>
-        </div>
+                <section className="detail-panel actions-panel">
+                  <h3>Recommended Actions</h3>
+                  <ul>
+                    {selectedInsight.recommended_actions.map((action, index) => (
+                      <li key={index}>{cleanExecutiveActionText(action)}</li>
+                    ))}
+                  </ul>
+                </section>
 
-        {!indexed && <p className="helper-note">Upload and index a document to enable follow-up Q&A.</p>}
+                <section className="detail-panel sources-panel">
+                  <div className="sources-head">
+                    <h3>Top Sources</h3>
+                    {indexed && (
+                      <button type="button" className="ghost-btn" disabled={!canRegenerateInsights} onClick={() => fetchInsights(indexed.doc_id)}>
+                        Regenerate
+                      </button>
+                    )}
+                  </div>
+                  {selectedInsight.citations.length === 0 ? (
+                    <p className="sources-empty">No source excerpts were available for this insight.</p>
+                  ) : (
+                    <div className="sources-list">
+                      {selectedInsight.citations.map((citation, index) => {
+                        const match = selectedMatchesBySource.get(citation.source_id);
+                        return (
+                          <details key={`${selectedInsight.module_id}-${citation.source_id}`} className="source-row">
+                            <summary>
+                              <span className="source-number">{index + 1}</span>
+                              <div>
+                                <p className="source-title">Source excerpt {index + 1}</p>
+                                <p className="source-confidence">{confidenceLabel(citation.score)}</p>
+                              </div>
+                            </summary>
+                            {match?.text && <p className="source-preview">{match.text}</p>}
+                          </details>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              </div>
+            </>
+          )}
+        </section>
 
-        <div className="answer-panel ask-answer-panel">
+        <section className="glass-card ask-card" ref={askSectionRef}>
+          <div className="ask-head">
+            <h2>Follow-up Q&A</h2>
+            <p>Ask deeper questions without leaving the executive brief context.</p>
+          </div>
+
+          <div className="ask-row">
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Ask a follow-up question..."
+              className="ask-input"
+            />
+            <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
+              {busy === "ask" ? "Asking..." : "Ask"}
+            </button>
+          </div>
+
+          {!indexed && <p className="helper-note">Upload and index a document to enable follow-up Q&A.</p>}
+
           {latestQuestion === "" ? (
-            <div className="empty-state">Your follow-up response appears here.</div>
+            <div className="empty-panel ask-empty">Your follow-up responses appear here.</div>
           ) : (
-            <div className="brief-shell">
-              <div className="question-brief">
-                <span className="question-brief-label">Question</span>
+            <div className="ask-response">
+              <div className="ask-question-block">
+                <span>Question</span>
                 <p>{latestQuestion}</p>
               </div>
 
               {latestAssistantMessage && (
-                <article className="insight-card">
-                  <div className="insight-card-header">
-                    <h4>Answer</h4>
+                <article className="ask-answer-block">
+                  <div className="ask-answer-head">
+                    <h3>Answer</h3>
                     {answerMode && (
-                      <span className={`answer-mode-chip ${answerMode}`}>
+                      <span className={`answer-mode ${answerMode}`}>
                         {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
                       </span>
                     )}
                   </div>
-
-                  <p className="insight-direct-answer">
+                  <p className="ask-direct-answer">
                     {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
                   </p>
 
-                  <div className="insight-grid">
-                    <section className="insight-section findings">
-                      <h5>Key findings</h5>
+                  <div className="ask-details-grid">
+                    <section>
+                      <h4>Key Findings</h4>
                       <ul>
                         {insightBrief.keyFindings.map((finding, index) => (
                           <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
@@ -666,8 +773,8 @@ export default function Home() {
                       </ul>
                     </section>
 
-                    <section className="insight-section actions">
-                      <h5>Recommended actions</h5>
+                    <section>
+                      <h4>Recommended Actions</h4>
                       <ul>
                         {insightBrief.recommendedActions.map((action, index) => (
                           <li key={index}>{action}</li>
@@ -679,37 +786,37 @@ export default function Home() {
               )}
             </div>
           )}
-        </div>
 
-        {citations.length > 0 && (
-          <div className="sources-block">
-            <h3>Supporting sources ({citations.length})</h3>
-            <div className="sources-list">
-              {citations.map((citation, index) => {
-                const match = matchesBySource.get(citation.source_id);
-
-                return (
-                  <details key={citation.source_id} className="source-card compact-source">
-                    <summary>
-                      <span className="source-rank">[{index + 1}]</span>
-                      <div className="source-summary-main">
-                        <span className="source-id">Source excerpt {index + 1}</span>
-                      </div>
-                    </summary>
-                    {match?.text && <p className="source-excerpt">{match.text}</p>}
-                  </details>
-                );
-              })}
+          {citations.length > 0 && (
+            <div className="ask-sources">
+              <h3>Supporting Sources</h3>
+              <div className="sources-list">
+                {citations.map((citation, index) => {
+                  const match = matchesBySource.get(citation.source_id);
+                  return (
+                    <details key={citation.source_id} className="source-row">
+                      <summary>
+                        <span className="source-number">{index + 1}</span>
+                        <div>
+                          <p className="source-title">Source excerpt {index + 1}</p>
+                          <p className="source-confidence">{confidenceLabel(citation.score)}</p>
+                        </div>
+                      </summary>
+                      {match?.text && <p className="source-preview">{match.text}</p>}
+                    </details>
+                  );
+                })}
+              </div>
             </div>
+          )}
+        </section>
+
+        {err && (
+          <div className="error-banner">
+            <strong>Problem:</strong> {err}
           </div>
         )}
       </section>
-
-      {err && (
-        <div className="error-banner">
-          <strong>Problem:</strong> {err}
-        </div>
-      )}
     </main>
   );
 }
