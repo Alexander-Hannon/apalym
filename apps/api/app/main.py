@@ -352,6 +352,50 @@ ASK_MAX_CHUNK_CHARS = 600
 ASK_MAX_CONTEXT_CHARS = 1800
 ASK_MAX_GENERATION_ATTEMPTS = 3
 ASK_RETRY_BASE_BACKOFF_SECONDS = 0.6
+INSIGHT_TOP_K_CAP = 5
+
+INSIGHT_MODULE_DEFINITIONS = [
+    {
+        "module_id": "loss-leakage",
+        "title": "Where are we losing money?",
+        "retrieval_query": (
+            "Identify where profitability is leaking, including revenue leakage, excess costs, "
+            "inefficiencies, write-offs, or recurring losses."
+        ),
+    },
+    {
+        "module_id": "top-cost-drivers",
+        "title": "Top cost drivers",
+        "retrieval_query": (
+            "Identify the largest cost drivers, recurring expense categories, and operational drivers "
+            "with the highest financial impact."
+        ),
+    },
+    {
+        "module_id": "key-risks",
+        "title": "Key risks",
+        "retrieval_query": (
+            "Identify key business risks, including compliance, liquidity, customer concentration, "
+            "operational bottlenecks, and execution risks."
+        ),
+    },
+    {
+        "module_id": "margin-opportunities",
+        "title": "Margin improvement opportunities",
+        "retrieval_query": (
+            "Identify practical margin improvement opportunities through pricing, discount discipline, "
+            "mix shifts, process efficiency, and cost optimization."
+        ),
+    },
+    {
+        "module_id": "trends-anomalies",
+        "title": "Notable trends or anomalies",
+        "retrieval_query": (
+            "Identify notable trends, abrupt changes, outliers, seasonality signals, and anomalies "
+            "that deserve investigation."
+        ),
+    },
+]
 
 class DemoRequest(BaseModel):
     message: str
@@ -366,10 +410,20 @@ class AskRequest(BaseModel):
     top_k: int = Field(3, ge=1, le=10)
     doc_id: Optional[str] = None  # optional: restrict to a document
 
+class InsightsRequest(BaseModel):
+    doc_id: str = Field(..., min_length=1)
+    top_k: int = Field(4, ge=1, le=10)
+
 class AskBrief(BaseModel):
     direct_answer: str
     key_findings: list[str]
     recommended_next_actions: list[str]
+
+class InsightModuleBrief(BaseModel):
+    summary: str
+    direct_answer: str
+    key_findings: list[str]
+    recommended_actions: list[str]
 
 def compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -488,6 +542,61 @@ def merge_brief_with_fallback(
         recommended_next_actions=recommended_actions[:4],
     )
 
+def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]]) -> InsightModuleBrief:
+    if not matches:
+        no_data = f"Not enough evidence was retrieved to assess '{module_title}' for this document."
+        return InsightModuleBrief(
+            summary=no_data,
+            direct_answer=no_data,
+            key_findings=[no_data],
+            recommended_actions=[
+                "Confirm the document was indexed and contains the financial/operational sections needed for this module."
+            ],
+        )
+
+    findings: list[str] = []
+    for match in matches[:4]:
+        md = match.get("metadata") or {}
+        citation_tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
+        excerpt = trim_snippet_text((match.get("text") or "").strip(), 180)
+        if excerpt:
+            findings.append(f"{excerpt} {citation_tag}")
+
+    if not findings:
+        no_excerpt = f"Evidence was retrieved for '{module_title}', but excerpts were empty."
+        findings = [no_excerpt]
+
+    summary = findings[0]
+
+    return InsightModuleBrief(
+        summary=summary,
+        direct_answer=summary,
+        key_findings=findings[:4],
+        recommended_actions=[
+            "Investigate the highest-impact cited item first and assign an owner with a target metric.",
+            "Validate root causes against source evidence and define a 30-day remediation plan.",
+        ],
+    )
+
+def merge_insight_brief_with_fallback(
+    parsed_brief: InsightModuleBrief | None,
+    fallback: InsightModuleBrief,
+) -> InsightModuleBrief:
+    if parsed_brief is None:
+        return fallback
+
+    summary = strip_markdown_emphasis(parsed_brief.summary) or fallback.summary
+    direct_answer = strip_markdown_emphasis(parsed_brief.direct_answer) or fallback.direct_answer
+    key_findings = clean_brief_list_items(parsed_brief.key_findings, fallback.key_findings)
+    recommended_actions = clean_brief_list_items(parsed_brief.recommended_actions, fallback.recommended_actions)
+
+    return InsightModuleBrief(
+        summary=summary,
+        direct_answer=direct_answer,
+        key_findings=key_findings[:4],
+        recommended_actions=recommended_actions[:4],
+    )
+
 def trim_snippet_text(text: str, max_chars: int) -> str:
     compact = compact_whitespace(text)
     if len(compact) <= max_chars:
@@ -598,6 +707,128 @@ def parse_model_json(text: str) -> dict | None:
     except Exception:
         return None
     return None
+
+def build_insight_module_prompt(
+    module_title: str,
+    retrieval_query: str,
+    context_block: str,
+) -> str:
+    return (
+        "You are a business analyst. Use only the provided document excerpts.\n"
+        "Do not invent facts. If evidence is weak, acknowledge uncertainty.\n"
+        "When citing evidence, use citation tags like [doc_id:chunk_id].\n\n"
+        f"Insight module: {module_title}\n"
+        f"Analysis focus: {retrieval_query}\n\n"
+        f"Document excerpts:\n{context_block}\n\n"
+        "Return ONLY valid JSON with keys:\n"
+        "- summary: concise business summary with citations\n"
+        "- direct_answer: direct answer to this module with citations\n"
+        "- key_findings: 2-4 specific findings, each with citations\n"
+        "- recommended_actions: 2-4 specific actions tied to findings"
+    )
+
+def generate_insight_module(
+    gemini: genai.Client,
+    model_name: str,
+    tenant_id: str,
+    request_id: str,
+    doc_id: str,
+    top_k: int,
+    module_def: dict[str, str],
+) -> dict[str, Any]:
+    module_id = module_def["module_id"]
+    title = module_def["title"]
+    retrieval_query = module_def["retrieval_query"]
+
+    matches = retrieve_matches(
+        tenant_id=tenant_id,
+        query_text=retrieval_query,
+        top_k=top_k,
+        doc_id=doc_id,
+        request_id=request_id,
+    )
+    citations = [m["citation"] for m in matches]
+    fallback = build_insight_module_fallback(title, matches)
+
+    if not matches:
+        return {
+            "module_id": module_id,
+            "title": title,
+            "summary": fallback.summary,
+            "direct_answer": fallback.direct_answer,
+            "key_findings": fallback.key_findings,
+            "recommended_actions": fallback.recommended_actions,
+            "citations": citations,
+            "matches": matches,
+            "status": "no_evidence",
+            "error": None,
+        }
+
+    snippets, _ = build_context_snippets(matches, max_chunk_chars=520, max_total_chars=2200)
+    context_block = "\n\n---\n\n".join(snippets)
+    full_prompt = build_insight_module_prompt(title, retrieval_query, context_block)
+
+    try:
+        resp = generate_content_with_retry(
+            gemini=gemini,
+            model_name=model_name,
+            full_prompt=full_prompt,
+            request_id=request_id,
+            tenant_id=tenant_id,
+            retrieved_k=len(matches),
+        )
+        model_text = getattr(resp, "text", None)
+        if model_text is None and isinstance(resp, dict):
+            model_text = resp.get("text")
+        if not model_text:
+            model_text = ""
+
+        parsed_brief: InsightModuleBrief | None = None
+        brief_obj = parse_model_json(model_text)
+        if brief_obj is not None:
+            try:
+                parsed_brief = InsightModuleBrief.model_validate(brief_obj)
+            except Exception:
+                parsed_brief = None
+
+        final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback)
+        return {
+            "module_id": module_id,
+            "title": title,
+            "summary": final_brief.summary,
+            "direct_answer": final_brief.direct_answer,
+            "key_findings": final_brief.key_findings,
+            "recommended_actions": final_brief.recommended_actions,
+            "citations": citations,
+            "matches": matches,
+            "status": "ok",
+            "error": None,
+        }
+    except Exception as error:
+        log_json(
+            level="ERROR",
+            event="insight_module_failed",
+            service="api",
+            request_id=request_id,
+            tenant_id=tenant_id,
+            doc_id=doc_id,
+            module_id=module_id,
+            module_title=title,
+            error=type(error).__name__,
+            detail=str(error)[:500],
+        )
+        return {
+            "module_id": module_id,
+            "title": title,
+            "summary": fallback.summary,
+            "direct_answer": fallback.direct_answer,
+            "key_findings": fallback.key_findings,
+            "recommended_actions": fallback.recommended_actions,
+            "citations": citations,
+            "matches": matches,
+            "status": "error",
+            "error": f"Module generation failed: {type(error).__name__}",
+        }
 
 
 #---------------------------------------------
@@ -1049,6 +1280,173 @@ def search(req: SearchRequest, request: Request):
         "matches": matches,
     }
 
+
+
+@app.post("/v1/insights")
+def generate_insights(req: InsightsRequest, request: Request):
+    request_id = request.state.request_id
+    tenant_id = get_tenant_id(request)
+    doc_id = req.doc_id.strip()
+
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="doc_id is required")
+
+    doc_path = get_doc_path(tenant_id, doc_id)
+    if not doc_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    effective_top_k = max(1, min(req.top_k, INSIGHT_TOP_K_CAP))
+    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.0-flash")
+    gemini = get_gemini_client()
+
+    module_results: list[dict[str, Any]] = []
+    success_count = 0
+
+    for module in INSIGHT_MODULE_DEFINITIONS:
+        module_id = module["module_id"]
+        module_title = module["title"]
+        retrieval_query = module["retrieval_query"]
+
+        try:
+            matches = retrieve_matches(
+                tenant_id=tenant_id,
+                query_text=retrieval_query,
+                top_k=effective_top_k,
+                doc_id=doc_id,
+                request_id=request_id,
+            )
+        except Exception as error:
+            module_results.append(
+                {
+                    "module_id": module_id,
+                    "title": module_title,
+                    "status": "failed",
+                    "error": f"Retrieval failed: {str(error)[:200]}",
+                    "summary": f"Could not generate '{module_title}' due to retrieval failure.",
+                    "direct_answer": f"Could not generate '{module_title}' due to retrieval failure.",
+                    "key_findings": [],
+                    "recommended_actions": [],
+                    "citations": [],
+                    "matches": [],
+                }
+            )
+            continue
+
+        citations = [m["citation"] for m in matches]
+        fallback_brief = build_insight_module_fallback(module_title, matches)
+
+        if not matches:
+            module_results.append(
+                {
+                    "module_id": module_id,
+                    "title": module_title,
+                    "status": "insufficient_evidence",
+                    "summary": fallback_brief.summary,
+                    "direct_answer": fallback_brief.direct_answer,
+                    "key_findings": fallback_brief.key_findings,
+                    "recommended_actions": fallback_brief.recommended_actions,
+                    "citations": citations,
+                    "matches": matches,
+                }
+            )
+            continue
+
+        snippets, _ = build_context_snippets(matches)
+        context_block = "\n\n---\n\n".join(snippets)
+
+        module_instruction = (
+            "You are a business diagnostics assistant. Use only the provided excerpts.\n"
+            "Return ONLY valid JSON with keys: summary, direct_answer, key_findings, recommended_actions.\n"
+            "Rules:\n"
+            "- summary: one concise diagnosis sentence grounded in evidence and with citations [doc_id:chunk_id]\n"
+            "- direct_answer: direct answer for this module with citations [doc_id:chunk_id]\n"
+            "- key_findings: 2-4 specific findings, each with citations [doc_id:chunk_id]\n"
+            "- recommended_actions: 2-4 concrete, non-generic business actions tied to findings\n"
+            "- Do not invent facts beyond excerpts."
+        )
+        module_prompt = (
+            f"Module: {module_title}\n"
+            f"Diagnostic goal: {retrieval_query}\n\n"
+            f"Document excerpts:\n{context_block}\n\n"
+            "Generate the JSON response now."
+        )
+        full_prompt = f"{module_instruction}\n\n{module_prompt}"
+
+        try:
+            resp = generate_content_with_retry(
+                gemini=gemini,
+                model_name=model_name,
+                full_prompt=full_prompt,
+                request_id=request_id,
+                tenant_id=tenant_id,
+                retrieved_k=len(matches),
+            )
+            raw_text = getattr(resp, "text", None)
+            if raw_text is None and isinstance(resp, dict):
+                raw_text = resp.get("text")
+            raw_text = raw_text or ""
+
+            parsed_obj = parse_model_json(raw_text)
+            parsed_brief = None
+            if parsed_obj is not None:
+                try:
+                    parsed_brief = InsightModuleBrief.model_validate(parsed_obj)
+                except Exception:
+                    parsed_brief = None
+
+            final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback_brief)
+
+            module_results.append(
+                {
+                    "module_id": module_id,
+                    "title": module_title,
+                    "status": "ok",
+                    "summary": final_brief.summary,
+                    "direct_answer": final_brief.direct_answer,
+                    "key_findings": final_brief.key_findings,
+                    "recommended_actions": final_brief.recommended_actions,
+                    "citations": citations,
+                    "matches": matches,
+                }
+            )
+            success_count += 1
+        except Exception as error:
+            module_results.append(
+                {
+                    "module_id": module_id,
+                    "title": module_title,
+                    "status": "fallback",
+                    "error": f"Generation failed: {str(error)[:200]}",
+                    "summary": fallback_brief.summary,
+                    "direct_answer": fallback_brief.direct_answer,
+                    "key_findings": fallback_brief.key_findings,
+                    "recommended_actions": fallback_brief.recommended_actions,
+                    "citations": citations,
+                    "matches": matches,
+                }
+            )
+
+    log_json(
+        level="INFO",
+        event="insights_generated",
+        service="api",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        doc_id=doc_id,
+        module_count=len(module_results),
+        successful_modules=success_count,
+    )
+
+    return {
+        "ok": True,
+        "service": "api",
+        "request_id": request_id,
+        "tenant_id": tenant_id,
+        "doc_id": doc_id,
+        "module_count": len(module_results),
+        "successful_modules": success_count,
+        "modules": module_results,
+    }
 
 
 @app.post("/v1/ask")

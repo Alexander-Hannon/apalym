@@ -1,6 +1,6 @@
 "use client";
 
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useMemo, useRef, useState } from "react";
 import { postForm, postJson } from "./lib/api";
 
 type UploadResp = {
@@ -24,11 +24,23 @@ type IndexResp = {
 
 type Citation = {
   source_id: string;
-  doc_id: string;
-  chunk_id: string;
-  start: number;
-  end: number;
-  score: number;
+  doc_id?: string | null;
+  chunk_id?: string | null;
+  start?: number | null;
+  end?: number | null;
+  score?: number | null;
+};
+
+type RetrievalMatch = {
+  id: string;
+  score?: number;
+  text: string;
+  metadata?: {
+    doc_id?: string;
+    chunk_id?: string;
+    start?: number;
+    end?: number;
+  };
 };
 
 type AskResp = {
@@ -49,25 +61,54 @@ type AskResp = {
   message?: string;
 };
 
-type ChatMessage = { role: "user" | "assistant"; text: string };
+type InsightModuleStatus = "ok" | "fallback" | "failed" | "insufficient_evidence";
 
-type RetrievalMatch = {
-  id: string;
-  score: number;
-  text: string;
-  metadata?: {
-    doc_id?: string;
-    chunk_id?: string;
-    start?: number;
-    end?: number;
-  };
+type InsightModule = {
+  module_id: string;
+  title: string;
+  status: InsightModuleStatus;
+  summary: string;
+  direct_answer: string;
+  key_findings: string[];
+  recommended_actions: string[];
+  citations: Citation[];
+  matches: RetrievalMatch[];
+  error?: string;
 };
+
+type InsightsResp = {
+  ok: boolean;
+  doc_id: string;
+  tenant_id: string;
+  request_id: string;
+  module_count: number;
+  successful_modules: number;
+  modules: InsightModule[];
+};
+
+type ChatMessage = { role: "user" | "assistant"; text: string };
 
 type InsightBrief = {
   directAnswer: string;
   keyFindings: string[];
   recommendedActions: string[];
 };
+
+type InsightTab = {
+  moduleId: string;
+  navLabel: string;
+  sidebarLabel: string;
+  icon: string;
+  tone: "losses" | "costs" | "risks" | "margins" | "trends";
+};
+
+const INSIGHT_TABS: InsightTab[] = [
+  { moduleId: "loss-leakage", navLabel: "Losses", sidebarLabel: "Losses", icon: "📉", tone: "losses" },
+  { moduleId: "top-cost-drivers", navLabel: "Costs", sidebarLabel: "Costs", icon: "📊", tone: "costs" },
+  { moduleId: "key-risks", navLabel: "Risks", sidebarLabel: "Risks", icon: "⚠️", tone: "risks" },
+  { moduleId: "margin-opportunities", navLabel: "Margins", sidebarLabel: "Margins", icon: "📈", tone: "margins" },
+  { moduleId: "trends-anomalies", navLabel: "Trends", sidebarLabel: "Trends", icon: "🪄", tone: "trends" },
+];
 
 function makeRequestId() {
   return `WEB-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -76,10 +117,6 @@ function makeRequestId() {
 function asErrorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message) return error.message;
   return fallback;
-}
-
-function statusClassName(state: "idle" | "ready" | "working" | "complete") {
-  return `status-chip status-${state}`;
 }
 
 function normalizeListLine(line: string) {
@@ -99,6 +136,19 @@ function splitCitationCandidates(tagPayload: string): string[] {
     .map((part) => part.trim())
     .filter(Boolean)
     .map((part) => normalizeCitationToken(part));
+}
+
+function stripRawUuidCitationNoise(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(/\[[0-9a-f]{8}-[0-9a-f-]{27}(?:\s*,\s*[0-9a-f]{8}-[0-9a-f-]{27})*\]/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function cleanExecutiveActionText(text: string): string {
+  if (!text) return "";
+  return stripRawUuidCitationNoise(text).replace(/\[[^\]]*:[^\]]*\]/g, "").replace(/\s{2,}/g, " ").trim();
 }
 
 function splitSentences(text: string) {
@@ -178,7 +228,6 @@ function buildInsightBrief(
     compactQuestion.length > 70 ? `${compactQuestion.slice(0, 67).trimEnd()}...` : compactQuestion;
 
   const recommendedActions = buildDynamicActions(shortQuestion, keyFindings);
-
   return { directAnswer, keyFindings, recommendedActions };
 }
 
@@ -210,7 +259,8 @@ function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
 }
 
 function renderTextWithCitationChips(text: string, citationOrder: Map<string, number>): ReactNode[] {
-  return text
+  const cleanedText = stripRawUuidCitationNoise(text);
+  return cleanedText
     .split(/(\[[^\]]+:[^\]]+\])/g)
     .filter(Boolean)
     .flatMap((part, index) => {
@@ -224,28 +274,60 @@ function renderTextWithCitationChips(text: string, citationOrder: Map<string, nu
       if (uniqueOrders.length === 0) return [];
 
       return uniqueOrders.map((order, citationIdx) => (
-        <span key={`tag-${index}-${citationIdx}`} className="inline-citation-chip">
+        <span key={`tag-${index}-${citationIdx}`} className="citation-chip">
           [{order}]
         </span>
       ));
     });
 }
 
-function confidenceBand(score: number) {
-  if (score >= 0.75) return { label: "High confidence", tone: "high" as const };
-  if (score >= 0.55) return { label: "Medium confidence", tone: "medium" as const };
-  return { label: "Low confidence", tone: "low" as const };
+function buildCitationOrder(citations: Citation[]): Map<string, number> {
+  const lookup = new Map<string, number>();
+  citations.forEach((citation, index) => {
+    lookup.set(normalizeCitationToken(citation.source_id), index + 1);
+    if (citation.doc_id && citation.chunk_id) {
+      lookup.set(normalizeCitationToken(`${citation.doc_id}:${citation.chunk_id}`), index + 1);
+    }
+  });
+  return lookup;
+}
+
+function statusHintForInsight(status: InsightModuleStatus): string {
+  if (status === "ok") return "";
+  if (status === "insufficient_evidence") return "Limited evidence is available for this module in the current document.";
+  if (status === "fallback") return "Using fallback synthesis due to temporary model constraints.";
+  return "This module could not be fully generated for the current run.";
+}
+
+function deriveFileType(filename?: string) {
+  const ext = filename?.split(".").pop()?.toUpperCase();
+  if (!ext) return "DOC";
+  if (["PDF", "CSV", "XLSX"].includes(ext)) return ext;
+  return ext.slice(0, 4);
+}
+
+function deriveGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+function confidenceLabel(score?: number | null) {
+  if (typeof score !== "number") return "Evidence";
+  if (score >= 0.75) return "High confidence";
+  if (score >= 0.55) return "Medium confidence";
+  return "Low confidence";
 }
 
 export default function Home() {
-  // demo tenant is fixed for non-technical demos
   const tenantId = "demo-tenant";
-
-  const [requestId, setRequestId] = useState(makeRequestId());
+  const [requestId] = useState(makeRequestId());
   const [file, setFile] = useState<File | null>(null);
-
   const [doc, setDoc] = useState<UploadResp | null>(null);
   const [indexed, setIndexed] = useState<IndexResp | null>(null);
+  const [insights, setInsights] = useState<InsightModule[]>([]);
+  const [activeInsightId, setActiveInsightId] = useState<string>(INSIGHT_TABS[0].moduleId);
 
   const [query, setQuery] = useState("");
   const [chat, setChat] = useState<ChatMessage[]>([]);
@@ -253,8 +335,13 @@ export default function Home() {
   const [sourceMatches, setSourceMatches] = useState<RetrievalMatch[]>([]);
   const [briefFromServer, setBriefFromServer] = useState<AskResp["brief"]>();
   const [answerMode, setAnswerMode] = useState<AskResp["answer_mode"] | null>(null);
-  const [busy, setBusy] = useState<null | "upload" | "ask">(null);
+  const [busy, setBusy] = useState<null | "upload" | "insights" | "ask">(null);
   const [err, setErr] = useState<string | null>(null);
+
+  const uploadSectionRef = useRef<HTMLElement | null>(null);
+  const briefSectionRef = useRef<HTMLElement | null>(null);
+  const askSectionRef = useRef<HTMLElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const headers = useMemo(
     () => ({
@@ -265,19 +352,38 @@ export default function Home() {
   );
 
   const canUpload = Boolean(file) && busy === null;
+  const canRegenerateInsights = Boolean(indexed) && busy === null;
   const canAsk = Boolean(indexed) && busy === null && query.trim().length > 0;
-  const hasAssistantAnswer = chat.some((entry) => entry.role === "assistant");
   const latestQuestion = [...chat].reverse().find((entry) => entry.role === "user")?.text ?? "";
   const latestAssistantMessage = [...chat].reverse().find((entry) => entry.role === "assistant")?.text ?? "";
 
-  const citationOrder = useMemo(() => {
-    const lookup = new Map<string, number>();
-    citations.forEach((citation, index) => {
-      lookup.set(normalizeCitationToken(citation.source_id), index + 1);
-      lookup.set(normalizeCitationToken(`${citation.doc_id}:${citation.chunk_id}`), index + 1);
-    });
+  const insightsById = useMemo(() => {
+    const map = new Map<string, InsightModule>();
+    insights.forEach((module) => map.set(module.module_id, module));
+    return map;
+  }, [insights]);
+
+  const selectedInsightId = useMemo(() => {
+    if (insightsById.has(activeInsightId)) return activeInsightId;
+    const firstAvailable = INSIGHT_TABS.find((tab) => insightsById.has(tab.moduleId));
+    return firstAvailable?.moduleId ?? activeInsightId;
+  }, [activeInsightId, insightsById]);
+
+  const selectedInsight = insightsById.get(selectedInsightId);
+  const selectedTab = INSIGHT_TABS.find((tab) => tab.moduleId === selectedInsightId) ?? INSIGHT_TABS[0];
+
+  const selectedCitationOrder = useMemo(
+    () => buildCitationOrder(selectedInsight?.citations ?? []),
+    [selectedInsight]
+  );
+
+  const selectedMatchesBySource = useMemo(() => {
+    const lookup = new Map<string, RetrievalMatch>();
+    (selectedInsight?.matches ?? []).forEach((match) => lookup.set(match.id, match));
     return lookup;
-  }, [citations]);
+  }, [selectedInsight]);
+
+  const citationOrder = useMemo(() => buildCitationOrder(citations), [citations]);
 
   const matchesBySource = useMemo(() => {
     const lookup = new Map<string, RetrievalMatch>();
@@ -292,33 +398,52 @@ export default function Home() {
     [latestAssistantMessage, latestQuestion, briefFromServer]
   );
 
+  async function fetchInsights(docId: string, clearOldInsights = false) {
+    if (clearOldInsights) setInsights([]);
+    setBusy("insights");
+    try {
+      const resp = (await postJson("/v1/insights", { doc_id: docId, top_k: 4 }, headers)) as InsightsResp;
+      setInsights(resp.modules ?? []);
+    } catch (e: unknown) {
+      setErr(asErrorMessage(e, "Insights generation failed"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function uploadAndIndex() {
     if (!file) return;
     setErr(null);
     setBusy("upload");
 
     try {
-      // 1) Upload
       const form = new FormData();
       form.append("file", file);
       const up = (await postForm("/v1/docs/upload", form, headers)) as UploadResp;
       setDoc(up);
 
-      // 2) Index (hardcoded chunking — NOT user-controlled)
       const CHUNK_SIZE = 700;
       const OVERLAP = 80;
-
       const idx = (await postJson(
         `/v1/docs/${up.doc_id}/index?chunk_size=${CHUNK_SIZE}&overlap=${OVERLAP}`,
         {},
         headers
       )) as IndexResp;
-
       setIndexed(idx);
-    } catch (e: unknown) {
-      setErr(asErrorMessage(e, "Upload/index failed"));
-    } finally {
+      setActiveInsightId(INSIGHT_TABS[0].moduleId);
+      setInsights([]);
+      setQuery("");
+      setChat([]);
+      setCitations([]);
+      setSourceMatches([]);
+      setBriefFromServer(undefined);
+      setAnswerMode(null);
+
       setBusy(null);
+      await fetchInsights(up.doc_id, true);
+    } catch (e: unknown) {
+      setBusy(null);
+      setErr(asErrorMessage(e, "Upload/index failed"));
     }
   }
 
@@ -335,8 +460,6 @@ export default function Home() {
     setBusy("ask");
     setAnswerMode(null);
     setBriefFromServer(undefined);
-
-    // Show the user question immediately
     setChat((c) => [...c, { role: "user", text: trimmedQuery }]);
 
     try {
@@ -370,213 +493,316 @@ export default function Home() {
     }
   }
 
-  const uploadStatus =
-    busy === "upload"
-      ? { label: "Processing", tone: "working" as const }
-      : indexed
-        ? { label: "Indexed", tone: "complete" as const }
-        : file
-          ? { label: "Ready", tone: "ready" as const }
-          : { label: "Awaiting file", tone: "idle" as const };
+  function openFilePicker() {
+    fileInputRef.current?.click();
+  }
 
-  const askStatus =
-    busy === "ask"
-      ? { label: "Generating answer", tone: "working" as const }
-      : hasAssistantAnswer
-        ? { label: "Answered", tone: "complete" as const }
+  function jumpToSection(target: "brief" | "ask" | "upload") {
+    if (target === "brief") {
+      briefSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (target === "ask") {
+      askSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    uploadSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function activateInsight(moduleId: string) {
+    setActiveInsightId(moduleId);
+    jumpToSection("brief");
+  }
+
+  const greeting = deriveGreeting();
+  const fileTypeLabel = deriveFileType(doc?.filename ?? file?.name);
+  const uploadStatusLabel =
+    busy === "upload"
+      ? "Indexing"
+      : busy === "insights"
+        ? "Generating insights"
         : indexed
-          ? { label: "Ready", tone: "ready" as const }
-          : { label: "Upload first", tone: "idle" as const };
+          ? "Ready"
+          : file
+            ? "Selected"
+            : "No document";
+  const headerSubtitle = doc?.filename
+    ? `Here’s your executive brief for ${doc.filename}`
+    : "Upload a business document to generate your executive diagnosis.";
 
   return (
-    <main className="demo-shell">
-      <header className="hero-block">
-        <p className="hero-kicker">Product Demo</p>
-        <h1>Apalym</h1>
-        <p className="hero-subtitle">
-          Upload a PDF, CSV, or XLSX file, ask a question, and verify every answer with scored source citations.
-        </p>
-
-        <div className="meta-strip">
-          <span className="meta-pill">
-            <span className="meta-pill-label">tenant</span>
-            <code>{tenantId}</code>
-          </span>
-          <span className="meta-pill">
-            <span className="meta-pill-label">request_id</span>
-            <code>{requestId}</code>
-          </span>
-          <button onClick={() => setRequestId(makeRequestId())} className="secondary-btn meta-refresh-btn">
-            New request ID
-          </button>
+    <main className="app-shell">
+      <aside className="sidebar">
+        <div className="brand-block">
+          <div className="brand-logo" aria-hidden>
+            ◈
+          </div>
+          <div>
+            <p className="brand-title">Apalym</p>
+            <p className="brand-subtitle">Executive AI</p>
+          </div>
         </div>
-      </header>
 
-      <div className="workflow-grid">
-        <section className="surface-card">
-          <div className="section-heading">
-            <div>
-              <p className="step-kicker">Step 1</p>
-              <h2>Upload document</h2>
-            </div>
-            <span className={statusClassName(uploadStatus.tone)}>{uploadStatus.label}</span>
-          </div>
-
-          <p className="section-copy">
-            Choose a PDF, CSV, or XLSX file. We apply stable indexing defaults automatically, with no setup required.
-          </p>
-
-          <label className="file-input-wrap">
-            <span className="file-input-label">Document file (PDF, CSV, or XLSX)</span>
-            <input
-              className="file-input"
-              type="file"
-              accept="application/pdf,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-            />
-          </label>
-
-          {file && (
-            <p className="selected-file">
-              Selected: <strong>{file.name}</strong>
-            </p>
-          )}
-
-          <button onClick={uploadAndIndex} disabled={!canUpload} className="primary-btn full-width">
-            {busy === "upload" ? "Uploading and indexing..." : "Upload file"}
+        <nav className="sidebar-nav">
+          <button className="nav-item active" type="button" onClick={() => jumpToSection("brief")}>
+            <span className="nav-icon">✦</span>
+            Executive Brief
           </button>
 
-          <div className="meta-table">
-            <div className="meta-row">
-              <span className="meta-key">Document</span>
-              <span className="meta-value">{doc?.filename ?? "--"}</span>
-            </div>
-            <div className="meta-row">
-              <span className="meta-key">doc_id</span>
-              <span className="meta-value">{doc?.doc_id ?? "--"}</span>
-            </div>
-            <div className="meta-row">
-              <span className="meta-key">Indexed chunks</span>
-              <span className="meta-value">{indexed ? `${indexed.upserted_count}` : "--"}</span>
+          {INSIGHT_TABS.map((tab) => (
+            <button
+              key={tab.moduleId}
+              type="button"
+              className={`nav-item tone-${tab.tone} ${selectedInsightId === tab.moduleId ? "active-soft" : ""}`}
+              onClick={() => activateInsight(tab.moduleId)}
+            >
+              <span className="nav-icon">{tab.icon}</span>
+              {tab.sidebarLabel}
+            </button>
+          ))}
+
+          <button className="nav-item" type="button" onClick={() => jumpToSection("ask")}>
+            <span className="nav-icon">💬</span>
+            Ask Follow-up
+          </button>
+          <button className="nav-item" type="button" onClick={() => jumpToSection("upload")}>
+            <span className="nav-icon">📄</span>
+            Documents
+          </button>
+          <button className="nav-item" type="button">
+            <span className="nav-icon">⚙️</span>
+            Settings
+          </button>
+        </nav>
+      </aside>
+
+      <section className="main-pane">
+        <header className="top-header">
+          <div>
+            <h1>
+              {greeting}, Acme <span aria-hidden>👋</span>
+            </h1>
+            <p>{headerSubtitle}</p>
+          </div>
+          <button type="button" className="header-upload-btn" onClick={openFilePicker}>
+            ⬆ Upload New Document
+          </button>
+        </header>
+
+        <section className="glass-card doc-card" ref={uploadSectionRef}>
+          <div className="doc-card-left">
+            <div className="file-badge">{fileTypeLabel}</div>
+            <div>
+              <p className="doc-name">{doc?.filename ?? file?.name ?? "No document selected"}</p>
+              <p className="doc-meta">
+                {indexed ? "Indexed and diagnosis-ready" : file ? "Ready to index" : "Upload PDF, CSV, or XLSX"}
+              </p>
             </div>
           </div>
+          <div className="doc-card-actions">
+            <span className={`status-pill ${indexed ? "ready" : busy === "upload" ? "working" : "idle"}`}>
+              {uploadStatusLabel}
+            </span>
+            <button type="button" className="ghost-btn" onClick={openFilePicker}>
+              Select Document
+            </button>
+            <button type="button" className="primary-btn" onClick={uploadAndIndex} disabled={!canUpload}>
+              {busy === "upload" ? "Uploading..." : "Generate Brief"}
+            </button>
+          </div>
+
+          <input
+            ref={fileInputRef}
+            className="hidden-file-input"
+            type="file"
+            accept="application/pdf,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          />
         </section>
 
-        <section className="surface-card">
-          <div className="section-heading">
-            <div>
-              <p className="step-kicker">Step 2</p>
-              <h2>Ask and review answer</h2>
-            </div>
-            <span className={statusClassName(askStatus.tone)}>{askStatus.label}</span>
+        <section className="glass-card brief-card" ref={briefSectionRef}>
+          <div className="brief-nav-shell" role="tablist" aria-label="Insight modules">
+            {INSIGHT_TABS.map((tab) => (
+              <button
+                key={tab.moduleId}
+                type="button"
+                className={`brief-tab tone-${tab.tone} ${selectedInsightId === tab.moduleId ? "active" : ""}`}
+                onClick={() => setActiveInsightId(tab.moduleId)}
+              >
+                <span>{tab.icon}</span>
+                {tab.navLabel}
+              </button>
+            ))}
           </div>
 
-          <p className="section-copy">Ask a question grounded in the uploaded document data.</p>
+          {!indexed && <div className="empty-panel">Upload and index a document to unlock the executive brief.</div>}
+
+          {busy === "insights" && (
+            <div className="empty-panel">
+              Building your diagnosis modules with document-grounded evidence and citations.
+            </div>
+          )}
+
+          {indexed && !busy && !selectedInsight && (
+            <div className="empty-panel">No insights were returned yet. Try regenerating the diagnosis.</div>
+          )}
+
+          {selectedInsight && (
+            <>
+              <article className={`insight-hero tone-${selectedTab.tone}`}>
+                <div className="insight-hero-main">
+                  <p className="hero-tag">Primary Insight</p>
+                  <h2>{selectedInsight.title}</h2>
+                  <p>{renderTextWithCitationChips(selectedInsight.direct_answer || selectedInsight.summary, selectedCitationOrder)}</p>
+                  {statusHintForInsight(selectedInsight.status) && (
+                    <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
+                  )}
+                </div>
+                <div className="hero-visual" aria-hidden>
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              </article>
+
+              <div className="details-grid">
+                <section className="detail-panel findings-panel">
+                  <h3>Key Findings</h3>
+                  <ul>
+                    {selectedInsight.key_findings.map((finding, index) => (
+                      <li key={index}>{renderTextWithCitationChips(finding, selectedCitationOrder)}</li>
+                    ))}
+                  </ul>
+                </section>
+
+                <section className="detail-panel actions-panel">
+                  <h3>Recommended Actions</h3>
+                  <ul>
+                    {selectedInsight.recommended_actions.map((action, index) => (
+                      <li key={index}>{cleanExecutiveActionText(action)}</li>
+                    ))}
+                  </ul>
+                </section>
+
+                <section className="detail-panel sources-panel">
+                  <div className="sources-head">
+                    <h3>Top Sources</h3>
+                    {indexed && (
+                      <button type="button" className="ghost-btn" disabled={!canRegenerateInsights} onClick={() => fetchInsights(indexed.doc_id)}>
+                        Regenerate
+                      </button>
+                    )}
+                  </div>
+                  {selectedInsight.citations.length === 0 ? (
+                    <p className="sources-empty">No source excerpts were available for this insight.</p>
+                  ) : (
+                    <div className="sources-list">
+                      {selectedInsight.citations.map((citation, index) => {
+                        const match = selectedMatchesBySource.get(citation.source_id);
+                        return (
+                          <details key={`${selectedInsight.module_id}-${citation.source_id}`} className="source-row">
+                            <summary>
+                              <span className="source-number">{index + 1}</span>
+                              <div>
+                                <p className="source-title">Source excerpt {index + 1}</p>
+                                <p className="source-confidence">{confidenceLabel(citation.score)}</p>
+                              </div>
+                            </summary>
+                            {match?.text && <p className="source-preview">{match.text}</p>}
+                          </details>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              </div>
+            </>
+          )}
+        </section>
+
+        <section className="glass-card ask-card" ref={askSectionRef}>
+          <div className="ask-head">
+            <h2>Follow-up Q&A</h2>
+            <p>Ask deeper questions without leaving the executive brief context.</p>
+          </div>
 
           <div className="ask-row">
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask a question about your PDF, CSV, or XLSX..."
-              className="query-input"
+              placeholder="Ask a follow-up question..."
+              className="ask-input"
             />
             <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
               {busy === "ask" ? "Asking..." : "Ask"}
             </button>
           </div>
 
-          {!indexed && <p className="helper-note">Upload and index a PDF, CSV, or XLSX file to enable Ask.</p>}
+          {!indexed && <p className="helper-note">Upload and index a document to enable follow-up Q&A.</p>}
 
-          <div className="answer-panel">
-            <div className="response-module-header">
-              <h3>Response</h3>
-              <span className={`response-state ${hasAssistantAnswer ? "ready" : "idle"}`}>
-                {hasAssistantAnswer ? "Grounded answer" : "Waiting for question"}
-              </span>
+          {latestQuestion === "" ? (
+            <div className="empty-panel ask-empty">Your follow-up responses appear here.</div>
+          ) : (
+            <div className="ask-response">
+              <div className="ask-question-block">
+                <span>Question</span>
+                <p>{latestQuestion}</p>
+              </div>
+
+              {latestAssistantMessage && (
+                <article className="ask-answer-block">
+                  <div className="ask-answer-head">
+                    <h3>Answer</h3>
+                    {answerMode && (
+                      <span className={`answer-mode ${answerMode}`}>
+                        {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
+                      </span>
+                    )}
+                  </div>
+                  <p className="ask-direct-answer">
+                    {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
+                  </p>
+
+                  <div className="ask-details-grid">
+                    <section>
+                      <h4>Key Findings</h4>
+                      <ul>
+                        {insightBrief.keyFindings.map((finding, index) => (
+                          <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
+                        ))}
+                      </ul>
+                    </section>
+
+                    <section>
+                      <h4>Recommended Actions</h4>
+                      <ul>
+                        {insightBrief.recommendedActions.map((action, index) => (
+                          <li key={index}>{action}</li>
+                        ))}
+                      </ul>
+                    </section>
+                  </div>
+                </article>
+              )}
             </div>
-            <p className="response-copy">
-              Answers are generated from indexed chunks and paired with scored source references.
-            </p>
-
-            {latestQuestion === "" ? (
-              <div className="empty-state">
-                Your conversation appears here after you ask a question.
-              </div>
-            ) : (
-              <div className="brief-shell">
-                <div className="question-brief">
-                  <span className="question-brief-label">Question</span>
-                  <p>{latestQuestion}</p>
-                </div>
-
-                {latestAssistantMessage && (
-                  <article className="insight-card">
-                    <div className="insight-card-header">
-                      <h4>Direct answer</h4>
-                      {answerMode && (
-                        <span className={`answer-mode-chip ${answerMode}`}>
-                          {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
-                        </span>
-                      )}
-                    </div>
-
-                    <p className="insight-direct-answer">
-                      {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
-                    </p>
-
-                    <div className="insight-grid">
-                      <section className="insight-section findings">
-                        <h5>Key findings</h5>
-                        <ul>
-                          {insightBrief.keyFindings.map((finding, index) => (
-                            <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
-                          ))}
-                        </ul>
-                      </section>
-
-                      <section className="insight-section actions">
-                        <h5>Recommended next actions</h5>
-                        <ul>
-                          {insightBrief.recommendedActions.map((action, index) => (
-                            <li key={index}>{action}</li>
-                          ))}
-                        </ul>
-                      </section>
-                    </div>
-                  </article>
-                )}
-              </div>
-            )}
-          </div>
+          )}
 
           {citations.length > 0 && (
-            <div className="sources-block">
-              <h3>Supporting sources ({citations.length})</h3>
-              <p className="sources-copy">Ranked evidence that grounds the answer and enables quick verification.</p>
-
+            <div className="ask-sources">
+              <h3>Supporting Sources</h3>
               <div className="sources-list">
                 {citations.map((citation, index) => {
                   const match = matchesBySource.get(citation.source_id);
-                  const confidence = confidenceBand(citation.score);
-
                   return (
-                    <details key={citation.source_id} className="source-card">
+                    <details key={citation.source_id} className="source-row">
                       <summary>
-                        <span className="source-rank">[{index + 1}]</span>
-                        <div className="source-summary-main">
-                          <span className="source-id">
-                            {citation.doc_id.slice(0, 8)}...:{citation.chunk_id}
-                          </span>
-                          <span className={`source-confidence ${confidence.tone}`}>{confidence.label}</span>
+                        <span className="source-number">{index + 1}</span>
+                        <div>
+                          <p className="source-title">Source excerpt {index + 1}</p>
+                          <p className="source-confidence">{confidenceLabel(citation.score)}</p>
                         </div>
-                        <span className="source-range">
-                          score {citation.score.toFixed(3)} • chars {citation.start}-{citation.end}
-                        </span>
                       </summary>
-                      {match?.text && <p className="source-excerpt">{match.text}</p>}
-                      <div className="source-note">
-                        Source ID: <code>{citation.source_id}</code>
-                      </div>
+                      {match?.text && <p className="source-preview">{match.text}</p>}
                     </details>
                   );
                 })}
@@ -584,13 +810,13 @@ export default function Home() {
             </div>
           )}
         </section>
-      </div>
 
-      {err && (
-        <div className="error-banner">
-          <strong>Problem:</strong> {err}
-        </div>
-      )}
+        {err && (
+          <div className="error-banner">
+            <strong>Problem:</strong> {err}
+          </div>
+        )}
+      </section>
     </main>
   );
 }
