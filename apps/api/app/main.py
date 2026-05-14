@@ -14,6 +14,8 @@ from pinecone.grpc import PineconeGRPC as Pinecone
 from typing import Optional, Any
 from google.genai import errors as genai_errors
 
+from app import client_test_auth as client_auth
+
 import json
 import time
 import uuid
@@ -37,10 +39,38 @@ STORAGE_DIR = Path("/app/storage")
 SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv", "xlsx")
 
 def get_tenant_id(request: Request) -> str:
-    # For now: hardcoded. Later: from auth / workspace selection.
-    tenant_id = "demo-tenant"
-    request.state.tenant_id = tenant_id
-    return tenant_id
+    """
+    Resolve tenant from client-test access keys when APALYM_CLIENT_TEST_KEYS is set.
+    Otherwise use open demo mode (single shared DEMO_TENANT_ID). Tenant is never
+    taken from client-supplied x-tenant-id headers.
+    """
+    key_map = client_auth.load_client_test_key_map()
+    if not key_map:
+        tenant_id = os.getenv("DEMO_TENANT_ID", "demo-tenant")
+        request.state.tenant_id = tenant_id
+        request.state.workspace_id = tenant_id
+        request.state.client_display_label = None
+        return tenant_id
+
+    token = client_auth.extract_bearer_token(request.headers.get("authorization"))
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing access key. Sign in or send Authorization: Bearer <access_key>.",
+        )
+    principal = client_auth.resolve_principal(token)
+    if not principal:
+        raise HTTPException(status_code=401, detail="Unknown access key.")
+
+    request.state.tenant_id = principal.tenant_id
+    request.state.workspace_id = principal.workspace_id
+    request.state.client_display_label = principal.display_label
+    return principal.tenant_id
+
+
+def _cors_allow_origins() -> list[str]:
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
 def get_doc_path(tenant_id: str, doc_id: str) -> Path:
@@ -350,9 +380,14 @@ AI_BASE_URL = os.getenv("AI_BASE_URL", "http://ai:8001")
 ASK_TOP_K_CAP = 3
 ASK_MAX_CHUNK_CHARS = 600
 ASK_MAX_CONTEXT_CHARS = 1800
-ASK_MAX_GENERATION_ATTEMPTS = 3
-ASK_RETRY_BASE_BACKOFF_SECONDS = 0.6
-INSIGHT_TOP_K_CAP = 5
+ASK_MAX_GENERATION_ATTEMPTS = 4
+ASK_RETRY_BASE_BACKOFF_SECONDS = 0.75
+INSIGHT_TOP_K_CAP = 3
+INSIGHT_MAX_CHUNK_CHARS = 480
+INSIGHT_MAX_CONTEXT_CHARS = 1500
+INSIGHT_MAX_GENERATION_ATTEMPTS = 5
+INSIGHT_RETRY_BASE_BACKOFF_SECONDS = 1.0
+INSIGHT_MODULE_PAUSE_SECONDS = 0.35
 
 INSIGHT_MODULE_DEFINITIONS = [
     {
@@ -412,7 +447,7 @@ class AskRequest(BaseModel):
 
 class InsightsRequest(BaseModel):
     doc_id: str = Field(..., min_length=1)
-    top_k: int = Field(4, ge=1, le=10)
+    top_k: int = Field(3, ge=1, le=8)
 
 class AskBrief(BaseModel):
     direct_answer: str
@@ -639,9 +674,16 @@ def is_retryable_generation_error(error: genai_errors.ClientError) -> bool:
     detail = str(error).lower()
     return (
         "429" in detail
+        or "503" in detail
         or "resource_exhausted" in detail
         or "rate limit" in detail
         or "quota" in detail
+        or "unavailable" in detail
+        or "deadline" in detail
+        or "timeout" in detail
+        or "temporarily" in detail
+        or "try again" in detail
+        or "internal" in detail
     )
 
 
@@ -652,10 +694,13 @@ def generate_content_with_retry(
     request_id: str,
     tenant_id: str,
     retrieved_k: int,
+    *,
+    max_attempts: int = ASK_MAX_GENERATION_ATTEMPTS,
+    base_backoff_seconds: float = ASK_RETRY_BASE_BACKOFF_SECONDS,
 ) -> Any:
     last_error: genai_errors.ClientError | None = None
 
-    for attempt in range(1, ASK_MAX_GENERATION_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
             return gemini.models.generate_content(
                 model=model_name,
@@ -664,10 +709,10 @@ def generate_content_with_retry(
         except genai_errors.ClientError as error:
             last_error = error
             retryable = is_retryable_generation_error(error)
-            if not retryable or attempt >= ASK_MAX_GENERATION_ATTEMPTS:
+            if not retryable or attempt >= max_attempts:
                 raise
 
-            backoff_seconds = ASK_RETRY_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            backoff_seconds = base_backoff_seconds * (2 ** (attempt - 1))
             log_json(
                 level="WARNING",
                 event="llm_call_retry",
@@ -776,6 +821,8 @@ def generate_insight_module(
             request_id=request_id,
             tenant_id=tenant_id,
             retrieved_k=len(matches),
+            max_attempts=INSIGHT_MAX_GENERATION_ATTEMPTS,
+            base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
         )
         model_text = getattr(resp, "text", None)
         if model_text is None and isinstance(resp, dict):
@@ -877,7 +924,7 @@ async def request_logging_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -892,12 +939,56 @@ def health():
     return {"ok": True, "service": "api"}
 
 
+@app.get("/v1/auth/config")
+def auth_config():
+    return {
+        "ok": True,
+        "service": "api",
+        "client_test_auth_enabled": client_auth.client_test_auth_enabled(),
+    }
+
+
+class ClientLoginRequest(BaseModel):
+    access_key: str = Field(..., min_length=1)
+
+
+@app.post("/v1/auth/login")
+def auth_login(req: ClientLoginRequest):
+    if not client_auth.client_test_auth_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="Client test keys are not configured on the server (open demo mode).",
+        )
+    principal = client_auth.resolve_principal(req.access_key.strip())
+    if not principal:
+        raise HTTPException(status_code=401, detail="Invalid access key.")
+    return {
+        "ok": True,
+        "service": "api",
+        "tenant_id": principal.tenant_id,
+        "workspace_id": principal.workspace_id,
+        "display_label": principal.display_label,
+    }
+
+
+@app.get("/v1/auth/session")
+def auth_session(request: Request):
+    tenant_id = get_tenant_id(request)
+    label = getattr(request.state, "client_display_label", None) or tenant_id
+    return {
+        "ok": True,
+        "service": "api",
+        "tenant_id": tenant_id,
+        "workspace_id": getattr(request.state, "workspace_id", tenant_id),
+        "display_label": label,
+    }
+
+
 @app.post("/v1/demo")
 async def demo(req: DemoRequest, request: Request):
      
     request_id = request.state.request_id
-    tenant_id = "demo-tenant"
-    request.state.tenant_id = tenant_id
+    tenant_id = get_tenant_id(request)
 
     payload = {"message": req.message}
 
@@ -1281,6 +1372,16 @@ def search(req: SearchRequest, request: Request):
     }
 
 
+def _neutral_insight_unavailable_copy() -> str:
+    return (
+        "This perspective could not be assembled from your document for this run. "
+        "Other diagnosis tabs or follow-up Q&A may still help."
+    )
+
+
+def _insight_module_for_response(module: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in module.items() if key != "error"}
+
 
 @app.post("/v1/insights")
 def generate_insights(req: InsightsRequest, request: Request):
@@ -1301,8 +1402,9 @@ def generate_insights(req: InsightsRequest, request: Request):
 
     module_results: list[dict[str, Any]] = []
     success_count = 0
+    neutral_copy = _neutral_insight_unavailable_copy()
 
-    for module in INSIGHT_MODULE_DEFINITIONS:
+    for mod_index, module in enumerate(INSIGHT_MODULE_DEFINITIONS):
         module_id = module["module_id"]
         module_title = module["title"]
         retrieval_query = module["retrieval_query"]
@@ -1316,20 +1418,52 @@ def generate_insights(req: InsightsRequest, request: Request):
                 request_id=request_id,
             )
         except Exception as error:
+            log_json(
+                level="ERROR",
+                event="insight_module_retrieval_failed",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                module_title=module_title,
+                doc_id_filter=doc_id,
+                top_k=effective_top_k,
+                detail=str(error)[:500],
+            )
             module_results.append(
                 {
                     "module_id": module_id,
                     "title": module_title,
                     "status": "failed",
-                    "error": f"Retrieval failed: {str(error)[:200]}",
-                    "summary": f"Could not generate '{module_title}' due to retrieval failure.",
-                    "direct_answer": f"Could not generate '{module_title}' due to retrieval failure.",
-                    "key_findings": [],
-                    "recommended_actions": [],
+                    "error": f"Retrieval failed: {str(error)[:500]}",
+                    "summary": neutral_copy,
+                    "direct_answer": neutral_copy,
+                    "key_findings": [
+                        "If this keeps happening, try a smaller file or retry once the workspace is less busy."
+                    ],
+                    "recommended_actions": [
+                        "Regenerate the diagnosis after upload completes, or ask a targeted follow-up question in Q&A.",
+                    ],
                     "citations": [],
                     "matches": [],
                 }
             )
+            log_json(
+                level="INFO",
+                event="insight_module_status",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                module_llm_status="failed",
+                retrieved_k=0,
+                doc_id_filter=doc_id,
+                top_k=effective_top_k,
+            )
+            if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
+                time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
             continue
 
         citations = [m["citation"] for m in matches]
@@ -1349,9 +1483,29 @@ def generate_insights(req: InsightsRequest, request: Request):
                     "matches": matches,
                 }
             )
+            success_count += 1
+            log_json(
+                level="INFO",
+                event="insight_module_status",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                module_llm_status="insufficient_evidence",
+                retrieved_k=0,
+                doc_id_filter=doc_id,
+                top_k=effective_top_k,
+            )
+            if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
+                time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
             continue
 
-        snippets, _ = build_context_snippets(matches)
+        snippets, context_chars = build_context_snippets(
+            matches,
+            max_chunk_chars=INSIGHT_MAX_CHUNK_CHARS,
+            max_total_chars=INSIGHT_MAX_CONTEXT_CHARS,
+        )
         context_block = "\n\n---\n\n".join(snippets)
 
         module_instruction = (
@@ -1380,6 +1534,8 @@ def generate_insights(req: InsightsRequest, request: Request):
                 request_id=request_id,
                 tenant_id=tenant_id,
                 retrieved_k=len(matches),
+                max_attempts=INSIGHT_MAX_GENERATION_ATTEMPTS,
+                base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
             )
             raw_text = getattr(resp, "text", None)
             if raw_text is None and isinstance(resp, dict):
@@ -1395,12 +1551,14 @@ def generate_insights(req: InsightsRequest, request: Request):
                     parsed_brief = None
 
             final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback_brief)
+            module_status = "ok" if parsed_brief is not None else "grounded"
+            llm_status_log = "generated" if parsed_brief is not None else "fallback"
 
             module_results.append(
                 {
                     "module_id": module_id,
                     "title": module_title,
-                    "status": "ok",
+                    "status": module_status,
                     "summary": final_brief.summary,
                     "direct_answer": final_brief.direct_answer,
                     "key_findings": final_brief.key_findings,
@@ -1410,13 +1568,43 @@ def generate_insights(req: InsightsRequest, request: Request):
                 }
             )
             success_count += 1
+            log_json(
+                level="INFO",
+                event="insight_module_status",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                module_llm_status=llm_status_log,
+                retrieved_k=len(matches),
+                doc_id_filter=doc_id,
+                top_k=effective_top_k,
+                context_chars=context_chars,
+                llm_model=model_name,
+            )
         except Exception as error:
+            log_json(
+                level="ERROR",
+                event="insight_module_generation_failed",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                module_title=module_title,
+                doc_id_filter=doc_id,
+                top_k=effective_top_k,
+                retrieved_k=len(matches),
+                error=type(error).__name__,
+                detail=str(error)[:500],
+            )
             module_results.append(
                 {
                     "module_id": module_id,
                     "title": module_title,
-                    "status": "fallback",
-                    "error": f"Generation failed: {str(error)[:200]}",
+                    "status": "grounded",
+                    "error": f"Generation failed: {type(error).__name__}",
                     "summary": fallback_brief.summary,
                     "direct_answer": fallback_brief.direct_answer,
                     "key_findings": fallback_brief.key_findings,
@@ -1425,6 +1613,24 @@ def generate_insights(req: InsightsRequest, request: Request):
                     "matches": matches,
                 }
             )
+            success_count += 1
+            log_json(
+                level="INFO",
+                event="insight_module_status",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                module_llm_status="fallback",
+                retrieved_k=len(matches),
+                doc_id_filter=doc_id,
+                top_k=effective_top_k,
+                llm_model=model_name,
+            )
+
+        if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
+            time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
 
     log_json(
         level="INFO",
@@ -1433,9 +1639,13 @@ def generate_insights(req: InsightsRequest, request: Request):
         request_id=request_id,
         tenant_id=tenant_id,
         doc_id=doc_id,
+        doc_id_filter=doc_id,
         module_count=len(module_results),
         successful_modules=success_count,
+        llm_model=model_name,
     )
+
+    client_modules = [_insight_module_for_response(m) for m in module_results]
 
     return {
         "ok": True,
@@ -1443,9 +1653,9 @@ def generate_insights(req: InsightsRequest, request: Request):
         "request_id": request_id,
         "tenant_id": tenant_id,
         "doc_id": doc_id,
-        "module_count": len(module_results),
+        "module_count": len(client_modules),
         "successful_modules": success_count,
-        "modules": module_results,
+        "modules": client_modules,
     }
 
 
@@ -1519,7 +1729,7 @@ def ask(req: AskRequest, request: Request):
             tenant_id=tenant_id,
             retrieved_k=len(matches),
         )
-    except genai_errors.ClientError as e:
+    except Exception as e:
         msg = str(e)
         log_json(
             level="ERROR",
@@ -1530,29 +1740,35 @@ def ask(req: AskRequest, request: Request):
             user_id=None,
             llm_provider="google",
             llm_model=model_name,
-            error="GENAI_CLIENT_ERROR",
+            error=type(e).__name__,
             detail=msg[:500],
             retrieved_k=len(matches),
             context_chars=context_chars,
             top_k=effective_top_k,
             doc_id_filter=req.doc_id,
             token_usage=None,
+            answer_mode="extractive",
         )
-        # Extractive fallback: answer from sources without generation
-        top = matches[:3]
-        bullets = []
-        for m in top:
-            txt = (m.get("text") or "").strip().replace("\n", " ")
-            if txt:
-                bullets.append(f"- {txt}")
+        extractive_findings: list[str] = []
+        for m in matches[:4]:
+            txt = trim_snippet_text((m.get("text") or "").strip(), 220)
+            if not txt:
+                continue
+            md = m.get("metadata") or {}
+            tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
+            extractive_findings.append(f"{txt} {tag}")
 
-        fallback_answer = (
-            "⚠️ LLM generation is currently unavailable. "
-            "Here are the most relevant excerpts from your documents:\n\n"
-            + "\n".join(bullets)
-            + "\n\nAnswer mode: extractive (no AI generation)."
+        if not extractive_findings:
+            extractive_findings = [
+                "No excerpt text was available for this question. Try rephrasing or asking about a different part of the document."
+            ]
+
+        direct_line = "The following points are taken directly from retrieved excerpts in your document."
+        fallback_brief = AskBrief(
+            direct_answer=direct_line,
+            key_findings=extractive_findings[:4],
+            recommended_next_actions=build_dynamic_fallback_actions(query_text, matches)[:4],
         )
-        fallback_brief = merge_brief_with_fallback(query_text, fallback_answer, None, matches)
 
         return {
             "ok": True,
@@ -1560,7 +1776,7 @@ def ask(req: AskRequest, request: Request):
             "request_id": request_id,
             "tenant_id": tenant_id,
             "query": req.query,
-            "answer": fallback_answer,
+            "answer": fallback_brief.direct_answer,
             "answer_mode": "extractive",
             "brief": {
                 "direct_answer": fallback_brief.direct_answer,

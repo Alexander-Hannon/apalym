@@ -53,6 +53,8 @@ input {
 }
 
 .sidebar {
+  display: flex;
+  flex-direction: column;
   border-right: 1px solid var(--border-soft);
   background:
     linear-gradient(180deg, rgba(13, 18, 32, 0.92), rgba(9, 12, 24, 0.94)),
@@ -97,6 +99,9 @@ input {
 .sidebar-nav {
   display: grid;
   gap: 4px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .nav-item {
@@ -862,4 +867,109 @@ input {
   .ask-row {
     flex-direction: column;
   }
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.sign-out-btn {
+  color: #f0b4bd;
+}
+
+.login-gate-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 18px;
+}
+
+.login-gate-status {
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.login-gate-card {
+  width: min(420px, 100%);
+  padding: 26px 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.login-gate-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.login-gate-lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.login-gate-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.login-gate-input {
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(8, 10, 20, 0.55);
+  color: var(--text);
+  padding: 10px 12px;
+}
+
+.login-gate-btn {
+  width: 100%;
+  justify-content: center;
+}
+
+.login-gate-error {
+  margin: 0;
+}
+
+.debug-panel {
+  margin-top: 8px;
+  padding: 18px 18px 16px;
+}
+
+.debug-panel h3 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.debug-panel-note {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.debug-dl {
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.debug-dl dt {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.debug-dl dd {
+  margin: 2px 0 0;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  color: #dbe4ff;
 }
