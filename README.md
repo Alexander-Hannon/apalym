@@ -33,7 +33,7 @@ Once running, the following services will be available:
 Service				URL
 
 Web UI				http://localhost:3000
-API				http://localhost:8000/health
+API				default port 8000 — `GET /health` (see `API_PORT` in `.env`)
 AI Service			http://localhost:8001/health
 
 
@@ -59,6 +59,12 @@ To create your local environment file:	cp .env.example .env
 
 
 (.env.example contains all required variables with placeholder values.)
+
+---
+
+## External pilot / client testing
+
+For **tenant-scoped access keys**, CORS, and operator checklist, see `docs/CLIENT_TESTING_DEPLOYMENT.md` and the **Client testing / tenant isolation** section in `.env.example`.
 
 
 -----------------------------------------------------------------------
