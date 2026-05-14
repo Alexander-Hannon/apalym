@@ -32,7 +32,7 @@ This document describes how to run Apalym for **isolated client testing** (uploa
 
 When `APALYM_CLIENT_TEST_KEYS` is **non-empty**:
 
-- Every `/v1/*` route **except** `/v1/auth/config` and `/v1/auth/login` requires `Authorization: Bearer <access_key>`.
+- Every `/v1/*` route **except** `GET /v1/auth/config` and `POST /v1/auth/login` requires `Authorization: Bearer <access_key>` (including `GET /v1/auth/session` for validating a stored key).
 - The API **ignores** `x-tenant-id` from clients; the tenant is always derived from the validated key.
 - Pinecone namespaces and on-disk storage paths are scoped to that tenant.
 
@@ -80,6 +80,7 @@ Distribute **only** the `sk_*` string to the matching client. Anyone with the ke
 
 ## Known limitations (explicit)
 
+- **Browser session storage**: The web app keeps the access key in **`sessionStorage`**. It is cleared when the tab/window is closed, is **not** shared across tabs, and is readable by any script on the **same origin** as the web app—use a dedicated pilot origin and standard XSS hygiene for external testers.
 - **Not full SSO/OIDC**: Bearer access keys are shared secrets, not user accounts with password policies or MFA.
 - **Workspace = tenant**: There is no separate workspace hierarchy in this sprint; `workspace_id` in auth responses equals `tenant_id`.
 - **Key compromise = tenant compromise**: Rotate keys by changing `APALYM_CLIENT_TEST_KEYS` and restarting **api**.

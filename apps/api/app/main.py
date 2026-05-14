@@ -70,7 +70,11 @@ def get_tenant_id(request: Request) -> str:
 
 def _cors_allow_origins() -> list[str]:
     raw = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000")
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # Empty misconfiguration would block all browser origins; fall back to local dev default.
+    if not origins:
+        return ["http://localhost:3000"]
+    return origins
 
 
 def get_doc_path(tenant_id: str, doc_id: str) -> Path:
