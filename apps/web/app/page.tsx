@@ -1,7 +1,13 @@
 "use client";
 
-import { type ReactNode, useMemo, useRef, useState } from "react";
-import { postForm, postJson } from "./lib/api";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { getJson, postForm, postJson } from "./lib/api";
+import {
+  clearClientSession,
+  persistClientSession,
+  readStoredAccessKey,
+  readStoredDisplayLabel,
+} from "./lib/authSession";
 
 type UploadResp = {
   ok: boolean;
@@ -61,7 +67,7 @@ type AskResp = {
   message?: string;
 };
 
-type InsightModuleStatus = "ok" | "fallback" | "failed" | "insufficient_evidence";
+type InsightModuleStatus = "ok" | "grounded" | "fallback" | "failed" | "insufficient_evidence";
 
 type InsightModule = {
   module_id: string;
@@ -294,9 +300,13 @@ function buildCitationOrder(citations: Citation[]): Map<string, number> {
 
 function statusHintForInsight(status: InsightModuleStatus): string {
   if (status === "ok") return "";
-  if (status === "insufficient_evidence") return "Limited evidence is available for this module in the current document.";
-  if (status === "fallback") return "Using fallback synthesis due to temporary model constraints.";
-  return "This module could not be fully generated for the current run.";
+  if (status === "insufficient_evidence") {
+    return "Limited evidence is available for this module in the current document.";
+  }
+  if (status === "grounded" || status === "fallback") {
+    return "Grounded from source evidence.";
+  }
+  return "This module could not be fully assembled for this run.";
 }
 
 function deriveFileType(filename?: string) {
@@ -321,8 +331,17 @@ function confidenceLabel(score?: number | null) {
 }
 
 export default function Home() {
-  const tenantId = "demo-tenant";
   const [requestId] = useState(makeRequestId());
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [accessKey, setAccessKey] = useState<string | null>(null);
+  const [displayLabel, setDisplayLabel] = useState("Demo workspace");
+  const [loginField, setLoginField] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [lastRequestId, setLastRequestId] = useState<string | null>(null);
+  const [lastTenantId, setLastTenantId] = useState<string | null>(null);
+
   const [file, setFile] = useState<File | null>(null);
   const [doc, setDoc] = useState<UploadResp | null>(null);
   const [indexed, setIndexed] = useState<IndexResp | null>(null);
@@ -343,13 +362,71 @@ export default function Home() {
   const askSectionRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const headers = useMemo(
-    () => ({
+  function recordApiResponseMeta(payload: unknown) {
+    if (!payload || typeof payload !== "object") return;
+    const obj = payload as { request_id?: string; tenant_id?: string };
+    if (obj.request_id) setLastRequestId(obj.request_id);
+    if (obj.tenant_id) setLastTenantId(obj.tenant_id);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initAuth() {
+      try {
+        const cfg = (await getJson("/v1/auth/config")) as { client_test_auth_enabled?: boolean };
+        if (cancelled) return;
+        const required = Boolean(cfg.client_test_auth_enabled);
+        setAuthRequired(required);
+        if (!required) {
+          setDisplayLabel("Demo workspace");
+          setAuthReady(true);
+          return;
+        }
+
+        const stored = readStoredAccessKey();
+        if (!stored) {
+          setAuthReady(true);
+          return;
+        }
+
+        try {
+          const sess = (await getJson("/v1/auth/session", {
+            Authorization: `Bearer ${stored}`,
+            "x-request-id": requestId,
+          })) as { display_label?: string };
+          if (cancelled) return;
+          setAccessKey(stored);
+          setDisplayLabel(sess.display_label ?? readStoredDisplayLabel() ?? "Workspace");
+        } catch {
+          clearClientSession();
+          setAccessKey(null);
+        } finally {
+          if (!cancelled) setAuthReady(true);
+        }
+      } catch {
+        if (cancelled) return;
+        setAuthRequired(false);
+        setDisplayLabel("Demo workspace");
+        setAuthReady(true);
+      }
+    }
+
+    void initAuth();
+    return () => {
+      cancelled = true;
+    };
+  }, [requestId]);
+
+  const headers = useMemo(() => {
+    const h: Record<string, string> = {
       "x-request-id": requestId,
-      "x-tenant-id": tenantId,
-    }),
-    [requestId, tenantId]
-  );
+    };
+    if (accessKey) {
+      h.Authorization = `Bearer ${accessKey}`;
+    }
+    return h;
+  }, [requestId, accessKey]);
 
   const canUpload = Boolean(file) && busy === null;
   const canRegenerateInsights = Boolean(indexed) && busy === null;
@@ -402,7 +479,8 @@ export default function Home() {
     if (clearOldInsights) setInsights([]);
     setBusy("insights");
     try {
-      const resp = (await postJson("/v1/insights", { doc_id: docId, top_k: 4 }, headers)) as InsightsResp;
+      const resp = (await postJson("/v1/insights", { doc_id: docId, top_k: 3 }, headers)) as InsightsResp;
+      recordApiResponseMeta(resp);
       setInsights(resp.modules ?? []);
     } catch (e: unknown) {
       setErr(asErrorMessage(e, "Insights generation failed"));
@@ -420,6 +498,7 @@ export default function Home() {
       const form = new FormData();
       form.append("file", file);
       const up = (await postForm("/v1/docs/upload", form, headers)) as UploadResp;
+      recordApiResponseMeta(up);
       setDoc(up);
 
       const CHUNK_SIZE = 700;
@@ -429,6 +508,7 @@ export default function Home() {
         {},
         headers
       )) as IndexResp;
+      recordApiResponseMeta(idx);
       setIndexed(idx);
       setActiveInsightId(INSIGHT_TABS[0].moduleId);
       setInsights([]);
@@ -471,7 +551,8 @@ export default function Home() {
 
       if (!resp.ok) {
         const msg = resp.message || "Ask failed";
-        setChat((c) => [...c, { role: "assistant", text: `⚠️ ${msg}` }]);
+        setChat((c) => [...c, { role: "assistant", text: msg }]);
+        recordApiResponseMeta(resp);
         setCitations(resp.citations ?? []);
         setSourceMatches(resp.matches ?? []);
         setBriefFromServer(resp.brief);
@@ -480,6 +561,7 @@ export default function Home() {
       }
 
       setChat((c) => [...c, { role: "assistant", text: resp.answer ?? "" }]);
+      recordApiResponseMeta(resp);
       setCitations(resp.citations ?? []);
       setSourceMatches(resp.matches ?? []);
       setBriefFromServer(resp.brief);
@@ -491,6 +573,50 @@ export default function Home() {
     } finally {
       setBusy(null);
     }
+  }
+
+  async function signIn() {
+    const trimmed = loginField.trim();
+    if (!trimmed) {
+      setErr("Enter the access key you were given for this test.");
+      return;
+    }
+    setErr(null);
+    setAuthBusy(true);
+    try {
+      const resp = (await postJson(
+        "/v1/auth/login",
+        { access_key: trimmed },
+        { "x-request-id": requestId }
+      )) as { display_label: string; tenant_id: string };
+      persistClientSession(trimmed, resp.display_label);
+      setAccessKey(trimmed);
+      setDisplayLabel(resp.display_label);
+      setLoginField("");
+    } catch (e: unknown) {
+      setErr(asErrorMessage(e, "Sign-in failed"));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function signOut() {
+    clearClientSession();
+    setAccessKey(null);
+    setDisplayLabel("Demo workspace");
+    setDebugOpen(false);
+    setFile(null);
+    setDoc(null);
+    setIndexed(null);
+    setInsights([]);
+    setQuery("");
+    setChat([]);
+    setCitations([]);
+    setSourceMatches([]);
+    setBriefFromServer(undefined);
+    setAnswerMode(null);
+    setLastRequestId(null);
+    setLastTenantId(null);
   }
 
   function openFilePicker() {
@@ -529,6 +655,54 @@ export default function Home() {
   const headerSubtitle = doc?.filename
     ? `Here’s your executive brief for ${doc.filename}`
     : "Upload a business document to generate your executive diagnosis.";
+
+  if (!authReady) {
+    return (
+      <main className="login-gate-screen">
+        <p className="login-gate-status">Preparing your workspace…</p>
+      </main>
+    );
+  }
+
+  if (authRequired && !accessKey) {
+    return (
+      <main className="login-gate-screen">
+        <section className="glass-card login-gate-card">
+          <div className="login-gate-brand">
+            <div className="brand-logo" aria-hidden>
+              ◈
+            </div>
+            <div>
+              <p className="brand-title">Apalym</p>
+              <p className="brand-subtitle">Client testing sign-in</p>
+            </div>
+          </div>
+          <p className="login-gate-lead">
+            Use the access key you were given. Your uploads and answers stay scoped to the workspace tied to that key.
+          </p>
+          <label className="login-gate-label">
+            Access key
+            <input
+              className="login-gate-input"
+              type="password"
+              autoComplete="off"
+              value={loginField}
+              onChange={(e) => setLoginField(e.target.value)}
+              placeholder="Paste your access key"
+            />
+          </label>
+          <button type="button" className="primary-btn login-gate-btn" onClick={() => void signIn()} disabled={authBusy}>
+            {authBusy ? "Signing in…" : "Sign in"}
+          </button>
+          {err && (
+            <div className="error-banner login-gate-error">
+              <strong>Problem:</strong> {err}
+            </div>
+          )}
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -569,18 +743,30 @@ export default function Home() {
             <span className="nav-icon">📄</span>
             Documents
           </button>
-          <button className="nav-item" type="button">
+          <button
+            className={`nav-item ${debugOpen ? "active-soft" : ""}`}
+            type="button"
+            onClick={() => setDebugOpen((open) => !open)}
+          >
             <span className="nav-icon">⚙️</span>
-            Settings
+            Diagnostics
           </button>
         </nav>
+        {accessKey && (
+          <div className="sidebar-footer">
+            <button className="nav-item sign-out-btn" type="button" onClick={signOut}>
+              <span className="nav-icon">⎋</span>
+              Sign out
+            </button>
+          </div>
+        )}
       </aside>
 
       <section className="main-pane">
         <header className="top-header">
           <div>
             <h1>
-              {greeting}, Acme <span aria-hidden>👋</span>
+              {greeting}, {displayLabel} <span aria-hidden>👋</span>
             </h1>
             <p>{headerSubtitle}</p>
           </div>
@@ -755,7 +941,7 @@ export default function Home() {
                     <h3>Answer</h3>
                     {answerMode && (
                       <span className={`answer-mode ${answerMode}`}>
-                        {answerMode === "rag" ? "AI-grounded" : "Extractive fallback"}
+                        {answerMode === "rag" ? "AI-grounded" : "Source-grounded"}
                       </span>
                     )}
                   </div>
@@ -810,6 +996,23 @@ export default function Home() {
             </div>
           )}
         </section>
+
+        {debugOpen && (
+          <section className="glass-card debug-panel" aria-label="Diagnostics">
+            <h3>Diagnostics</h3>
+            <p className="debug-panel-note">For support only. Do not share access keys from this screen.</p>
+            <dl className="debug-dl">
+              <div>
+                <dt>Last request id</dt>
+                <dd>{lastRequestId ?? "—"}</dd>
+              </div>
+              <div>
+                <dt>Workspace tenant id</dt>
+                <dd>{lastTenantId ?? "—"}</dd>
+              </div>
+            </dl>
+          </section>
+        )}
 
         {err && (
           <div className="error-banner">
