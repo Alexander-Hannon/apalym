@@ -16,3 +16,14 @@ Health Endpoint
 
 Container Port
 8000
+
+----
+
+ACM Certificate:
+Status: Issued
+
+Domain:
+api.apalym.com
+
+Date Issued:
+6/5/26
