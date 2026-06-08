@@ -27,3 +27,28 @@ api.apalym.com
 
 Date Issued:
 6/5/26
+
+
+
+----
+
+## June 8 Progress
+
+Completed:
+- ECS service healthy
+- Target group healthy
+- ALB healthy
+- ACM SSL certificate issued
+- HTTPS listener (443) configured
+- api.apalym.com DNS configured
+- https://api.apalym.com/health returning healthy response
+
+Outstanding:
+- Amplify frontend still needs final redeploy using:
+  NEXT_PUBLIC_API_BASE=https://api.apalym.com
+
+Remaining validation:
+- Generate Brief workflow
+- Upload workflow
+- Auth config endpoint
+- Mixed-content verification
