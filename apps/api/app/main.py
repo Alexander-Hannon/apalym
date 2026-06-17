@@ -584,66 +584,70 @@ def merge_brief_with_fallback(
     )
 
 MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
-    "loss-leakage": {
+    "losses": {
         "direct_answer": (
-            "The document does not provide enough detail to isolate exact loss drivers, "
-            "but the available evidence suggests likely leakage areas that leadership should review."
+            "The document does not provide enough clean detail to isolate exact loss drivers. "
+            "Based on the available evidence, leadership should review likely leakage areas "
+            "and validate them with supporting schedules."
         ),
         "key_findings": [
-            "Revenue leakage may be tied to discounts, returns, billing errors, underutilized assets, or delayed collections if referenced in the source material.",
-            "The document does not provide enough detail to quantify each driver with confidence.",
-            "Additional transaction-level or department-level data would improve the diagnosis.",
+            "The available evidence suggests possible revenue or profit leakage, but it does not quantify each driver with confidence.",
+            "Likely areas to review include discounts, returns, labor inefficiency, underutilized assets, delayed collections, or billing issues.",
+            "Additional transaction-level, department-level, or customer-level detail is needed to separate recurring leakage from one-time variance.",
         ],
         "recommended_actions": [
-            "Identify the top 3 variance categories by dollar impact.",
+            "Identify the top three variance categories by dollar impact.",
             "Separate one-time issues from recurring operating leakage.",
-            "Assign owners to investigate each suspected loss driver.",
-            "Validate with P&L, AR, refunds, labor, or operations schedules.",
+            "Assign owners to validate each suspected loss driver with supporting P&L, A/R, labor, refunds, or operations schedules.",
+            "Re-run the analysis after uploading supporting detail.",
         ],
     },
-    "top-cost-drivers": {
+    "costs": {
         "direct_answer": (
-            "The document does not provide enough detail to fully diagnose cost pressure, "
-            "but the available evidence suggests possible cost drivers that should be reviewed."
+            "The document does not provide enough clean detail to fully isolate cost pressure. "
+            "Based on the available evidence, likely cost drivers should be reviewed across "
+            "labor, logistics, vendor spend, maintenance, claims, and overhead."
         ),
         "key_findings": [
-            "Cost pressure may be tied to labor, logistics, vendor spend, maintenance, or overhead if referenced in the source material.",
-            "The source material does not provide enough detail to separate controllable and non-controllable costs.",
-            "More granular cost schedules would improve confidence in the diagnosis.",
+            "Cost pressure may be present, but the available source evidence is not detailed enough to quantify each driver with confidence.",
+            "Labor, logistics, vendor spend, maintenance, claims, and overhead should be reviewed as potential controllable cost categories.",
+            "More granular cost schedules are needed to separate controllable costs from one-time or non-controllable variance.",
         ],
         "recommended_actions": [
-            "Break costs into labor, logistics, vendor, maintenance, claims, and overhead categories.",
+            "Break costs into labor, logistics, vendor, maintenance, claims, and overhead.",
             "Compare each category against budget and prior period.",
-            "Identify the top 3 recurring cost drivers by dollar impact.",
-            "Assign savings targets and owners.",
+            "Identify the top three recurring cost drivers by dollar impact.",
+            "Assign cost owners and 30-day reduction targets.",
         ],
     },
-    "key-risks": {
+    "risks": {
         "direct_answer": (
-            "The document does not provide enough detail to create a complete risk register, "
-            "but it indicates several areas that leadership should review before making decisions."
+            "The document does not provide enough clean detail to create a complete risk register. "
+            "Based on the available evidence, leadership should review operational execution, "
+            "cost control, compliance, vendor dependency, and cash flow risks."
         ),
         "key_findings": [
-            "Potential risks may include execution delays, margin pressure, cash flow volatility, compliance exposure, or operational bottlenecks if referenced in the source material.",
-            "The document does not fully define likelihood, impact, or owners for identified risks.",
-            "Additional operational and financial detail is needed to prioritize risk severity.",
+            "The available evidence suggests possible risk areas, but it does not fully define likelihood, impact, owners, or mitigation steps.",
+            "Possible risks include execution delays, margin pressure, labor inefficiency, compliance exposure, vendor dependency, or cash flow volatility.",
+            "More detailed operating and financial support is needed to prioritize risk severity.",
         ],
         "recommended_actions": [
-            "Create a simple risk tracker with owner, severity, likelihood, mitigation, and deadline.",
+            "Create a simple risk tracker with owner, likelihood, impact, mitigation, and deadline.",
             "Validate high-risk areas with department owners.",
             "Prioritize risks by financial impact and time sensitivity.",
             "Review mitigation progress weekly.",
         ],
     },
-    "margin-opportunities": {
+    "margins": {
         "direct_answer": (
-            "The document does not provide enough detail to calculate margin drivers precisely, "
-            "but the available evidence suggests margin pressure areas that should be reviewed."
+            "The document does not provide enough clean detail to calculate precise margin drivers. "
+            "Based on the available evidence, leadership should review pricing, discounts, labor, "
+            "logistics, returns, claims, and customer or product mix."
         ),
         "key_findings": [
-            "Margin pressure may be tied to pricing, discounts, labor, logistics, returns, or product mix if referenced in the source material.",
-            "Source data may not provide enough gross margin detail by customer, product, or channel.",
-            "Additional margin schedules are needed for a precise diagnosis.",
+            "Margin pressure may be present, but the source evidence does not provide enough detail to isolate exact drivers.",
+            "Pricing, discounting, labor, logistics, returns, claims, and mix should be reviewed as possible margin factors.",
+            "More detailed gross margin by customer, product, service line, or channel would improve confidence.",
         ],
         "recommended_actions": [
             "Break margin by product, customer, channel, or service line.",
@@ -652,18 +656,19 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
             "Build a 30-day margin improvement action plan.",
         ],
     },
-    "trends-anomalies": {
+    "trends": {
         "direct_answer": (
-            "The document does not provide enough time-series detail to confirm a trend, "
-            "but the available evidence suggests patterns worth monitoring."
+            "The document does not provide enough clean time-series detail to confirm a trend "
+            "with confidence. Based on the available evidence, leadership should monitor "
+            "recurring changes in revenue, costs, utilization, returns, collections, labor, and demand."
         ),
         "key_findings": [
-            "The available excerpts may indicate changes in revenue, costs, utilization, or demand patterns.",
-            "The source material may not provide enough time periods to distinguish a trend from a one-time variance.",
-            "More period-over-period data would improve confidence in trend identification.",
+            "The available excerpts may indicate changes over time, but they do not provide enough clean period-over-period detail to confirm trend strength.",
+            "Possible patterns may exist in revenue, costs, utilization, labor, returns, collections, or demand.",
+            "More historical data is needed to distinguish recurring trends from one-time variance.",
         ],
         "recommended_actions": [
-            "Compare the last 3-6 periods for the relevant metrics.",
+            "Compare the last three to six periods for the relevant metrics.",
             "Separate one-time anomalies from recurring patterns.",
             "Track leading indicators weekly.",
             "Re-run the analysis with updated monthly data.",
@@ -673,21 +678,54 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
 
 _GENERIC_FALLBACK_COPY: dict[str, Any] = {
     "direct_answer": (
-        "The available document excerpts do not provide enough structured detail to make "
-        "a definitive diagnosis for this category. Leadership should review the underlying "
-        "source data and validate the likely drivers before acting."
+        "The document does not provide enough clean detail to make a definitive diagnosis "
+        "for this category. Based on the available evidence, leadership should validate "
+        "the issue with supporting data before acting."
     ),
     "key_findings": [
-        "Limited structured evidence was available for this analysis category.",
-        "The source material may contain relevant signals, but they could not be reliably synthesized.",
-        "Additional supporting schedules or data would improve confidence.",
+        "The available evidence is directionally useful but incomplete.",
+        "The document does not provide enough detail to confirm severity, owner, or root cause.",
+        "Additional supporting schedules or department-level detail would improve confidence.",
     ],
     "recommended_actions": [
-        "Request supporting data for this analysis area (e.g. detailed schedules, P&L breakdown).",
-        "Validate assumptions with department owners.",
-        "Re-run the analysis when more documentation is available.",
+        "Identify the top three possible drivers by financial or operational impact.",
+        "Assign an owner to validate each driver with supporting data.",
+        "Set a follow-up review date and re-run the analysis after uploading more detail.",
     ],
 }
+
+
+def normalize_module_key(module_id: str, module_title: str = "") -> str:
+    combined = f"{module_id} {module_title}".lower()
+    if "loss" in combined or "leakage" in combined:
+        return "losses"
+    if "cost" in combined or "expense" in combined:
+        return "costs"
+    if "risk" in combined or "compliance" in combined:
+        return "risks"
+    if "margin" in combined or "pricing" in combined:
+        return "margins"
+    if "trend" in combined or "anomal" in combined:
+        return "trends"
+    return ""
+
+
+def get_module_fallback_copy(module_id: str, module_title: str = "") -> dict[str, Any]:
+    key = normalize_module_key(module_id, module_title)
+    return MODULE_FALLBACK_COPY.get(key, _GENERIC_FALLBACK_COPY)
+
+
+def looks_generic_or_low_value_action(text: str) -> bool:
+    low = compact_whitespace(text).lower()
+    generic_phrases = (
+        "investigate the highest-impact cited item",
+        "validate root causes against source evidence",
+        "define a 30-day remediation plan",
+        "review the source evidence",
+        "analyze the document",
+        "build a risk/cost tracker to monitor progress against identified items",
+    )
+    return any(phrase in low for phrase in generic_phrases)
 
 
 _BROKEN_LEADING_SUFFIXES = re.compile(
@@ -744,23 +782,18 @@ def sanitize_fragment_to_sentence(raw: str) -> str:
 
 
 def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]], module_id: str = "") -> InsightModuleBrief:
-    copy = MODULE_FALLBACK_COPY.get(module_id, _GENERIC_FALLBACK_COPY)
+    copy = get_module_fallback_copy(module_id, module_title)
 
-    if not matches:
-        evidence_qualifier = "Confidence: Low. This assessment is based on general business considerations, not document evidence."
-        return InsightModuleBrief(
-            summary=copy["direct_answer"],
-            direct_answer=f"{copy['direct_answer']} {evidence_qualifier}",
-            key_findings=copy["key_findings"][:4],
-            recommended_actions=copy["recommended_actions"][:4],
-        )
-
-    evidence_qualifier = "Confidence: Low. Based on limited source evidence that should be validated with supporting data."
+    evidence_qualifier = (
+        "Confidence: Low. Based on limited source evidence that should be validated with supporting data."
+        if matches else
+        "Confidence: Low. This assessment is based on general business considerations, not document evidence."
+    )
     return InsightModuleBrief(
         summary=copy["direct_answer"],
         direct_answer=f"{copy['direct_answer']} {evidence_qualifier}",
-        key_findings=copy["key_findings"][:4],
-        recommended_actions=copy["recommended_actions"][:4],
+        key_findings=list(copy["key_findings"][:4]),
+        recommended_actions=list(copy["recommended_actions"][:4]),
     )
 
 
@@ -1558,33 +1591,33 @@ def enforce_module_quality_gate(
     doc_id: str,
 ) -> dict[str, Any]:
     """Final quality gate: prevents raw retrieved fragments from reaching pilot
-    users even when LLM marks output as generated."""
+    users even when LLM marks output as generated. Guarantees non-empty
+    direct_answer, key_findings (>=3), and recommended_actions (>=3)."""
     module_id = module.get("module_id", "")
-    copy = MODULE_FALLBACK_COPY.get(module_id, _GENERIC_FALLBACK_COPY)
+    module_title = module.get("title", "")
+    copy = get_module_fallback_copy(module_id, module_title)
     fields_replaced: list[str] = []
 
     da = module.get("direct_answer", "")
-    if looks_like_raw_or_broken(da):
-        module["direct_answer"] = copy["direct_answer"] + " Confidence: Low. Based on limited source evidence that should be validated with supporting data."
+    if not da or looks_like_raw_or_broken(da):
+        module["direct_answer"] = copy["direct_answer"]
         fields_replaced.append("direct_answer")
 
     summary = module.get("summary", "")
-    if looks_like_raw_or_broken(summary):
+    if not summary or looks_like_raw_or_broken(summary):
         module["summary"] = module["direct_answer"]
         fields_replaced.append("summary")
 
-    kf = module.get("key_findings", [])
-    any_finding_bad = any(looks_like_raw_or_broken(f) for f in kf)
-    if any_finding_bad:
-        module["key_findings"] = copy["key_findings"][:4]
+    kf = module.get("key_findings") or []
+    if len(kf) < 3 or any(looks_like_raw_or_broken(f) for f in kf):
+        module["key_findings"] = list(copy["key_findings"][:4])
         fields_replaced.append("key_findings")
 
-    ra = module.get("recommended_actions", [])
-    any_action_bad = any(looks_like_raw_or_broken(a) for a in ra)
-    if any_action_bad or (fields_replaced and "key_findings" in fields_replaced):
-        module["recommended_actions"] = copy["recommended_actions"][:4]
-        if "recommended_actions" not in fields_replaced:
-            fields_replaced.append("recommended_actions")
+    ra = module.get("recommended_actions") or []
+    all_generic = all(looks_generic_or_low_value_action(a) for a in ra) if ra else True
+    if len(ra) < 3 or any(looks_like_raw_or_broken(a) for a in ra) or all_generic:
+        module["recommended_actions"] = list(copy["recommended_actions"][:4])
+        fields_replaced.append("recommended_actions")
 
     if fields_replaced:
         original_status = module.get("status", "unknown")
@@ -1598,7 +1631,7 @@ def enforce_module_quality_gate(
             tenant_id=tenant_id,
             doc_id_filter=doc_id,
             module_id=module_id,
-            module_title=module.get("title", ""),
+            module_title=module_title,
             original_module_llm_status=original_status,
             new_module_llm_status="grounded",
             fields_replaced=fields_replaced,
