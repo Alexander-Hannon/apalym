@@ -581,15 +581,50 @@ def merge_brief_with_fallback(
         recommended_next_actions=recommended_actions[:4],
     )
 
-def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]]) -> InsightModuleBrief:
+INFERRED_RISK_BULLETS = {
+    "key-risks": [
+        "Revenue concentration: dependency on a narrow customer or product base",
+        "Margin compression: rising input costs without corresponding price adjustments",
+        "Cash-flow variability: timing mismatches between receivables and payables",
+    ],
+    "loss-leakage": [
+        "Unrecovered discounts or rebates applied without corresponding revenue offset",
+        "Operational write-offs accumulating below reporting thresholds",
+        "Under-utilised capacity driving fixed-cost absorption losses",
+    ],
+    "top-cost-drivers": [
+        "Labour and subcontractor costs growing faster than revenue",
+        "Logistics and freight charges with limited competitive-bidding discipline",
+        "Technology and licensing spend without clear utilisation tracking",
+    ],
+    "margin-opportunities": [
+        "Pricing uplift potential on low-elasticity SKUs or service tiers",
+        "Discount discipline tightening for outlier transactions",
+        "Procurement consolidation to capture volume-based savings",
+    ],
+    "trends-anomalies": [
+        "Seasonal demand swings that may mask underlying trajectory changes",
+        "Quarter-over-quarter variance spikes warranting root-cause investigation",
+        "Product or segment mix shifts altering blended margin profile",
+    ],
+}
+
+
+def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]], module_id: str = "") -> InsightModuleBrief:
     if not matches:
-        no_data = f"Not enough evidence was retrieved to assess '{module_title}' for this document."
+        inferred = INFERRED_RISK_BULLETS.get(module_id, INFERRED_RISK_BULLETS.get("key-risks", []))
+        summary = (
+            f"No explicit evidence for '{module_title}' was identified in the source material. "
+            "The following are common inferred considerations for this category."
+        )
+        findings = [f"{bullet} (inferred — not cited in document)" for bullet in inferred]
         return InsightModuleBrief(
-            summary=no_data,
-            direct_answer=no_data,
-            key_findings=[no_data],
+            summary=summary,
+            direct_answer=summary,
+            key_findings=findings[:4],
             recommended_actions=[
-                "Confirm the document was indexed and contains the financial/operational sections needed for this module."
+                "Request the underlying data source (e.g. general ledger, trial balance) to validate inferred items.",
+                "Flag inferred items for the next management review cycle as discussion topics.",
             ],
         )
 
@@ -763,16 +798,19 @@ def build_insight_module_prompt(
     context_block: str,
 ) -> str:
     return (
-        "You are a business analyst. Use only the provided document excerpts.\n"
-        "Do not invent facts. If evidence is weak, acknowledge uncertainty.\n"
-        "When citing evidence, use citation tags like [doc_id:chunk_id].\n\n"
+        "You are a senior business analyst writing for an executive audience.\n"
+        "Use the provided document excerpts as primary evidence.\n"
+        "When citing evidence, use citation tags like [doc_id:chunk_id].\n"
+        "If evidence is limited or indirect, still provide a best-effort executive analysis.\n"
+        "Infer plausible items from context and label them with 'Confidence: Low' or 'Inferred'.\n"
+        "NEVER say 'the document does not mention' or 'no information available'.\n\n"
         f"Insight module: {module_title}\n"
         f"Analysis focus: {retrieval_query}\n\n"
         f"Document excerpts:\n{context_block}\n\n"
         "Return ONLY valid JSON with keys:\n"
-        "- summary: concise business summary with citations\n"
-        "- direct_answer: direct answer to this module with citations\n"
-        "- key_findings: 2-4 specific findings, each with citations\n"
+        "- summary: concise executive summary with citations\n"
+        "- direct_answer: direct executive answer to this module with citations\n"
+        "- key_findings: 2-4 specific findings, each with citations where available\n"
         "- recommended_actions: 2-4 specific actions tied to findings"
     )
 
@@ -797,7 +835,7 @@ def generate_insight_module(
         request_id=request_id,
     )
     citations = [m["citation"] for m in matches]
-    fallback = build_insight_module_fallback(title, matches)
+    fallback = build_insight_module_fallback(title, matches, module_id=module_id)
 
     if not matches:
         return {
@@ -1471,7 +1509,7 @@ def generate_insights(req: InsightsRequest, request: Request):
             continue
 
         citations = [m["citation"] for m in matches]
-        fallback_brief = build_insight_module_fallback(module_title, matches)
+        fallback_brief = build_insight_module_fallback(module_title, matches, module_id=module_id)
 
         if not matches:
             module_results.append(
@@ -1513,14 +1551,18 @@ def generate_insights(req: InsightsRequest, request: Request):
         context_block = "\n\n---\n\n".join(snippets)
 
         module_instruction = (
-            "You are a business diagnostics assistant. Use only the provided excerpts.\n"
+            "You are a senior business diagnostics analyst writing for an executive audience.\n"
             "Return ONLY valid JSON with keys: summary, direct_answer, key_findings, recommended_actions.\n"
             "Rules:\n"
-            "- summary: one concise diagnosis sentence grounded in evidence and with citations [doc_id:chunk_id]\n"
-            "- direct_answer: direct answer for this module with citations [doc_id:chunk_id]\n"
+            "- summary: one concise diagnosis sentence grounded in evidence with citations [doc_id:chunk_id]\n"
+            "- direct_answer: direct executive-level answer for this module with citations [doc_id:chunk_id]\n"
             "- key_findings: 2-4 specific findings, each with citations [doc_id:chunk_id]\n"
             "- recommended_actions: 2-4 concrete, non-generic business actions tied to findings\n"
-            "- Do not invent facts beyond excerpts."
+            "- If evidence is limited or indirect, still provide a best-effort executive analysis.\n"
+            "  Infer plausible risks, cost drivers, or opportunities from whatever context is available.\n"
+            "  Label inferred items with 'Confidence: Low' or 'Inferred' so the reader knows.\n"
+            "- NEVER say 'the document does not mention' or 'no information available'.\n"
+            "  Instead, provide thoughtful inferred analysis and flag the confidence level."
         )
         module_prompt = (
             f"Module: {module_title}\n"
@@ -1697,23 +1739,32 @@ def ask(req: AskRequest, request: Request):
     context_block = "\n\n---\n\n".join(snippets)
 
     system_instruction = (
-        "You are an assistant that answers ONLY using the provided document excerpts.\n"
-        "If the answer is not in the excerpts, say you cannot find it.\n"
-        "When you use a fact, include the citation tag like [doc_id:chunk_id]."
+        "You are a document-informed business advisor with executive judgment.\n"
+        "Use the provided document excerpts as your primary evidence base.\n"
+        "When you use a fact from the excerpts, include the citation tag like [doc_id:chunk_id].\n\n"
+        "For factual questions: ground your answer in the excerpts with citations.\n"
+        "For implementation, strategy, or 'how should I' questions: use the document context\n"
+        "as a starting point, then layer in practical business reasoning, best-practice\n"
+        "recommendations, and executive judgment. Clearly distinguish document-sourced facts\n"
+        "(with citations) from your advisory recommendations.\n\n"
+        "NEVER say 'the document does not discuss' or 'I cannot find that'.\n"
+        "Instead, provide thoughtful, actionable guidance informed by whatever context is available."
     )
 
     user_prompt = (
         f"Question: {query_text}\n\n"
         f"Document excerpts:\n{context_block}\n\n"
-        "Answer the question using only the excerpts. Include citations."
+        "Provide an executive-quality answer. Cite document evidence where available.\n"
+        "For advisory or implementation questions, add practical recommendations and next steps."
     )
 
     brief_instruction = (
         "Return JSON with keys: direct_answer, key_findings, recommended_next_actions.\n"
         "Rules:\n"
-        "- direct_answer: one concise business answer with citations like [doc_id:chunk_id]\n"
-        "- key_findings: 2-4 concrete findings tied to the provided evidence and include citations\n"
-        "- recommended_next_actions: 2-4 specific operational/business next steps tailored to the question and evidence\n"
+        "- direct_answer: one concise executive answer. Cite document evidence with [doc_id:chunk_id] where applicable.\n"
+        "- key_findings: 2-4 concrete findings. Cite document evidence where available; advisory points are also welcome.\n"
+        "- recommended_next_actions: 2-4 specific operational/business next steps tailored to the question and evidence.\n"
+        "  These should be practical and implementation-ready, not generic filler.\n"
         "- Do NOT output generic filler like 'validate answer' or 'ask follow-up'\n"
         "- Return ONLY valid JSON"
     )

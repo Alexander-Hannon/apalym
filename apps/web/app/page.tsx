@@ -1,6 +1,6 @@
 "use client";
 
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getJson, postForm, postJson } from "./lib/api";
 import {
   clearClientSession,
@@ -361,6 +361,14 @@ export default function Home() {
   const briefSectionRef = useRef<HTMLElement | null>(null);
   const askSectionRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const askTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const resizeAskTextarea = useCallback(() => {
+    const el = askTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, []);
 
   function recordApiResponseMeta(payload: unknown) {
     if (!payload || typeof payload !== "object") return;
@@ -619,7 +627,24 @@ export default function Home() {
     setLastTenantId(null);
   }
 
+  function resetForNewUpload() {
+    setFile(null);
+    setDoc(null);
+    setIndexed(null);
+    setInsights([]);
+    setActiveInsightId(INSIGHT_TABS[0].moduleId);
+    setQuery("");
+    setChat([]);
+    setCitations([]);
+    setSourceMatches([]);
+    setBriefFromServer(undefined);
+    setAnswerMode(null);
+    setErr(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
   function openFilePicker() {
+    if (fileInputRef.current) fileInputRef.current.value = "";
     fileInputRef.current?.click();
   }
 
@@ -770,7 +795,7 @@ export default function Home() {
             </h1>
             <p>{headerSubtitle}</p>
           </div>
-          <button type="button" className="header-upload-btn" onClick={openFilePicker}>
+          <button type="button" className="header-upload-btn" onClick={() => { resetForNewUpload(); openFilePicker(); }}>
             ⬆ Upload New Document
           </button>
         </header>
@@ -913,11 +938,14 @@ export default function Home() {
           </div>
 
           <div className="ask-row">
-            <input
+            <textarea
+              ref={askTextareaRef}
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              rows={1}
+              onChange={(e) => { setQuery(e.target.value); resizeAskTextarea(); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }}
               placeholder="Ask a follow-up question..."
-              className="ask-input"
+              className="ask-input ask-textarea"
             />
             <button onClick={ask} disabled={!canAsk} className="primary-btn ask-btn">
               {busy === "ask" ? "Asking..." : "Ask"}
