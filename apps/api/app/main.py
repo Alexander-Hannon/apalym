@@ -1439,7 +1439,7 @@ def generate_insights(req: InsightsRequest, request: Request):
         raise HTTPException(status_code=404, detail="Document not found")
 
     effective_top_k = max(1, min(req.top_k, INSIGHT_TOP_K_CAP))
-    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.0-flash")
+    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
     gemini = get_gemini_client()
 
     module_results: list[dict[str, Any]] = []
@@ -1771,7 +1771,7 @@ def ask(req: AskRequest, request: Request):
 
     # 3) Generate answer (Gemini)
     gemini = get_gemini_client()
-    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.0-flash")
+    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
 
     full_prompt = f"{system_instruction}\n\n{user_prompt}\n\n{brief_instruction}"
 
