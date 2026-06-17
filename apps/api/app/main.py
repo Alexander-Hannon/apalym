@@ -583,33 +583,133 @@ def merge_brief_with_fallback(
         recommended_next_actions=recommended_actions[:4],
     )
 
-INFERRED_RISK_BULLETS = {
-    "key-risks": [
-        "Revenue concentration: dependency on a narrow customer or product base",
-        "Margin compression: rising input costs without corresponding price adjustments",
-        "Cash-flow variability: timing mismatches between receivables and payables",
+MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
+    "loss-leakage": {
+        "direct_answer": (
+            "The document does not provide enough detail to isolate exact loss drivers, "
+            "but the available evidence suggests likely leakage areas that leadership should review."
+        ),
+        "key_findings": [
+            "Revenue leakage may be tied to discounts, returns, billing errors, underutilized assets, or delayed collections if referenced in the source material.",
+            "The document does not provide enough detail to quantify each driver with confidence.",
+            "Additional transaction-level or department-level data would improve the diagnosis.",
+        ],
+        "recommended_actions": [
+            "Identify the top 3 variance categories by dollar impact.",
+            "Separate one-time issues from recurring operating leakage.",
+            "Assign owners to investigate each suspected loss driver.",
+            "Validate with P&L, AR, refunds, labor, or operations schedules.",
+        ],
+    },
+    "top-cost-drivers": {
+        "direct_answer": (
+            "The document does not provide enough detail to fully diagnose cost pressure, "
+            "but the available evidence suggests possible cost drivers that should be reviewed."
+        ),
+        "key_findings": [
+            "Cost pressure may be tied to labor, logistics, vendor spend, maintenance, or overhead if referenced in the source material.",
+            "The source material does not provide enough detail to separate controllable and non-controllable costs.",
+            "More granular cost schedules would improve confidence in the diagnosis.",
+        ],
+        "recommended_actions": [
+            "Break costs into labor, logistics, vendor, maintenance, claims, and overhead categories.",
+            "Compare each category against budget and prior period.",
+            "Identify the top 3 recurring cost drivers by dollar impact.",
+            "Assign savings targets and owners.",
+        ],
+    },
+    "key-risks": {
+        "direct_answer": (
+            "The document does not provide enough detail to create a complete risk register, "
+            "but it indicates several areas that leadership should review before making decisions."
+        ),
+        "key_findings": [
+            "Potential risks may include execution delays, margin pressure, cash flow volatility, compliance exposure, or operational bottlenecks if referenced in the source material.",
+            "The document does not fully define likelihood, impact, or owners for identified risks.",
+            "Additional operational and financial detail is needed to prioritize risk severity.",
+        ],
+        "recommended_actions": [
+            "Create a simple risk tracker with owner, severity, likelihood, mitigation, and deadline.",
+            "Validate high-risk areas with department owners.",
+            "Prioritize risks by financial impact and time sensitivity.",
+            "Review mitigation progress weekly.",
+        ],
+    },
+    "margin-opportunities": {
+        "direct_answer": (
+            "The document does not provide enough detail to calculate margin drivers precisely, "
+            "but the available evidence suggests margin pressure areas that should be reviewed."
+        ),
+        "key_findings": [
+            "Margin pressure may be tied to pricing, discounts, labor, logistics, returns, or product mix if referenced in the source material.",
+            "Source data may not provide enough gross margin detail by customer, product, or channel.",
+            "Additional margin schedules are needed for a precise diagnosis.",
+        ],
+        "recommended_actions": [
+            "Break margin by product, customer, channel, or service line.",
+            "Identify low-margin segments and high-cost-to-serve customers.",
+            "Compare pricing and discounting against profitability.",
+            "Build a 30-day margin improvement action plan.",
+        ],
+    },
+    "trends-anomalies": {
+        "direct_answer": (
+            "The document does not provide enough time-series detail to confirm a trend, "
+            "but the available evidence suggests patterns worth monitoring."
+        ),
+        "key_findings": [
+            "The available excerpts may indicate changes in revenue, costs, utilization, or demand patterns.",
+            "The source material may not provide enough time periods to distinguish a trend from a one-time variance.",
+            "More period-over-period data would improve confidence in trend identification.",
+        ],
+        "recommended_actions": [
+            "Compare the last 3-6 periods for the relevant metrics.",
+            "Separate one-time anomalies from recurring patterns.",
+            "Track leading indicators weekly.",
+            "Re-run the analysis with updated monthly data.",
+        ],
+    },
+}
+
+_GENERIC_FALLBACK_COPY: dict[str, Any] = {
+    "direct_answer": (
+        "The available document excerpts do not provide enough structured detail to make "
+        "a definitive diagnosis for this category. Leadership should review the underlying "
+        "source data and validate the likely drivers before acting."
+    ),
+    "key_findings": [
+        "Limited structured evidence was available for this analysis category.",
+        "The source material may contain relevant signals, but they could not be reliably synthesized.",
+        "Additional supporting schedules or data would improve confidence.",
     ],
-    "loss-leakage": [
-        "Unrecovered discounts or rebates applied without corresponding revenue offset",
-        "Operational write-offs accumulating below reporting thresholds",
-        "Under-utilised capacity driving fixed-cost absorption losses",
-    ],
-    "top-cost-drivers": [
-        "Labour and subcontractor costs growing faster than revenue",
-        "Logistics and freight charges with limited competitive-bidding discipline",
-        "Technology and licensing spend without clear utilisation tracking",
-    ],
-    "margin-opportunities": [
-        "Pricing uplift potential on low-elasticity SKUs or service tiers",
-        "Discount discipline tightening for outlier transactions",
-        "Procurement consolidation to capture volume-based savings",
-    ],
-    "trends-anomalies": [
-        "Seasonal demand swings that may mask underlying trajectory changes",
-        "Quarter-over-quarter variance spikes warranting root-cause investigation",
-        "Product or segment mix shifts altering blended margin profile",
+    "recommended_actions": [
+        "Request supporting data for this analysis area (e.g. detailed schedules, P&L breakdown).",
+        "Validate assumptions with department owners.",
+        "Re-run the analysis when more documentation is available.",
     ],
 }
+
+
+def is_raw_fragment(text: str) -> bool:
+    if not text or not text.strip():
+        return True
+    words = text.split()
+    if len(words) < 5:
+        return True
+    if re.search(r"\b(Medium|Low|High)\s+(Medium|Low|High)\b", text, re.IGNORECASE):
+        return True
+    pct_count = text.count("%")
+    dollar_count = text.count("$")
+    if pct_count + dollar_count >= 4 and len(words) < 20:
+        return True
+    if re.search(r"^\s*\w{1,3}\s", text) and not re.match(r"^(The|A|An|It|If|No|In)\s", text, re.IGNORECASE):
+        return True
+    if text.count("\t") >= 2:
+        return True
+    non_alpha = sum(1 for c in text if not c.isalpha() and not c.isspace())
+    if len(text) > 0 and non_alpha / len(text) > 0.35:
+        return True
+    return False
 
 
 def sanitize_fragment_to_sentence(raw: str) -> str:
@@ -617,6 +717,8 @@ def sanitize_fragment_to_sentence(raw: str) -> str:
     cleaned = re.sub(r"\b(Medium|Low|High)\s+(Medium|Low|High)\b", r"\1", cleaned)
     cleaned = re.sub(r"\s+(\.\s*)+", ". ", cleaned)
     cleaned = re.sub(r"^\W+", "", cleaned)
+    cleaned = re.sub(r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = compact_whitespace(cleaned)
     if cleaned and cleaned[0].islower():
         cleaned = cleaned[0].upper() + cleaned[1:]
     if cleaned and cleaned[-1] not in ".!?":
@@ -625,61 +727,24 @@ def sanitize_fragment_to_sentence(raw: str) -> str:
 
 
 def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]], module_id: str = "") -> InsightModuleBrief:
+    copy = MODULE_FALLBACK_COPY.get(module_id, _GENERIC_FALLBACK_COPY)
+
     if not matches:
-        inferred = INFERRED_RISK_BULLETS.get(module_id, INFERRED_RISK_BULLETS.get("key-risks", []))
-        summary = (
-            f"The document does not provide a complete view of '{module_title}', "
-            "but the following areas typically deserve leadership review in this category."
-        )
-        findings = [f"{bullet} (inferred — not directly cited in document)." for bullet in inferred]
+        evidence_qualifier = "Confidence: Low. This assessment is based on general business considerations, not document evidence."
         return InsightModuleBrief(
-            summary=summary,
-            direct_answer=summary,
-            key_findings=findings[:4],
-            recommended_actions=[
-                "Request the underlying data source (e.g. general ledger, trial balance) to validate inferred items.",
-                "Flag inferred items for the next management review cycle as discussion topics.",
-                "Re-run analysis when more documentation is available.",
-            ],
+            summary=copy["direct_answer"],
+            direct_answer=f"{copy['direct_answer']} {evidence_qualifier}",
+            key_findings=copy["key_findings"][:4],
+            recommended_actions=copy["recommended_actions"][:4],
         )
 
-    findings: list[str] = []
-    for match in matches[:4]:
-        md = match.get("metadata") or {}
-        citation_tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
-        raw_text = (match.get("text") or "").strip()
-        sentence = sanitize_fragment_to_sentence(raw_text)
-        excerpt = trim_snippet_text(sentence, 200)
-        if excerpt:
-            findings.append(f"{excerpt} {citation_tag}")
-
-    if not findings:
-        no_excerpt = f"Evidence was retrieved for '{module_title}', but excerpts could not be synthesized."
-        findings = [no_excerpt]
-
-    summary = findings[0]
-
+    evidence_qualifier = "Confidence: Low. Based on limited source evidence that should be validated with supporting data."
     return InsightModuleBrief(
-        summary=summary,
-        direct_answer=summary,
-        key_findings=findings[:4],
-        recommended_actions=[
-            "Investigate the highest-impact cited item first and assign an owner with a target metric.",
-            "Validate root causes against source evidence and define a 30-day remediation plan.",
-            "Build a risk/cost tracker to monitor progress against identified items.",
-        ],
+        summary=copy["direct_answer"],
+        direct_answer=f"{copy['direct_answer']} {evidence_qualifier}",
+        key_findings=copy["key_findings"][:4],
+        recommended_actions=copy["recommended_actions"][:4],
     )
-
-def is_raw_fragment(text: str) -> bool:
-    words = text.split()
-    if len(words) < 4:
-        return True
-    if text.count("  ") > 2:
-        return True
-    repeated = re.search(r"\b(Medium|Low|High)\s+\1\b", text, re.IGNORECASE)
-    if repeated:
-        return True
-    return False
 
 
 def merge_insight_brief_with_fallback(
@@ -694,6 +759,11 @@ def merge_insight_brief_with_fallback(
     key_findings = clean_brief_list_items(parsed_brief.key_findings, fallback.key_findings)
     recommended_actions = clean_brief_list_items(parsed_brief.recommended_actions, fallback.recommended_actions)
 
+    if is_raw_fragment(summary):
+        summary = fallback.summary
+    if is_raw_fragment(direct_answer):
+        direct_answer = fallback.direct_answer
+
     sanitized_findings = []
     for finding in key_findings:
         if is_raw_fragment(finding):
@@ -701,9 +771,13 @@ def merge_insight_brief_with_fallback(
         else:
             sanitized_findings.append(finding)
 
+    any_still_bad = any(is_raw_fragment(f) for f in sanitized_findings)
+    if any_still_bad:
+        sanitized_findings = fallback.key_findings
+
     return InsightModuleBrief(
-        summary=summary if not is_raw_fragment(summary) else sanitize_fragment_to_sentence(summary),
-        direct_answer=direct_answer if not is_raw_fragment(direct_answer) else sanitize_fragment_to_sentence(direct_answer),
+        summary=summary,
+        direct_answer=direct_answer,
         key_findings=sanitized_findings[:4],
         recommended_actions=recommended_actions[:4],
     )
@@ -1635,8 +1709,14 @@ def generate_insights(req: InsightsRequest, request: Request):
                     parsed_brief = None
 
             final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback_brief)
-            module_status = "ok" if parsed_brief is not None else "grounded"
-            llm_status_log = "generated" if parsed_brief is not None else "fallback"
+            if parsed_brief is not None:
+                module_status = "ok"
+                llm_status_log = "generated"
+                fallback_reason = None
+            else:
+                module_status = "grounded"
+                llm_status_log = "fallback_polished"
+                fallback_reason = "json_parse_failed"
 
             module_results.append(
                 {
@@ -1661,6 +1741,7 @@ def generate_insights(req: InsightsRequest, request: Request):
                 doc_id=doc_id,
                 module_id=module_id,
                 module_llm_status=llm_status_log,
+                fallback_reason=fallback_reason,
                 retrieved_k=len(matches),
                 doc_id_filter=doc_id,
                 top_k=effective_top_k,
@@ -1706,7 +1787,8 @@ def generate_insights(req: InsightsRequest, request: Request):
                 tenant_id=tenant_id,
                 doc_id=doc_id,
                 module_id=module_id,
-                module_llm_status="fallback",
+                module_llm_status="fallback_polished",
+                fallback_reason="llm_failed",
                 retrieved_k=len(matches),
                 doc_id_filter=doc_id,
                 top_k=effective_top_k,
@@ -1850,23 +1932,31 @@ def ask(req: AskRequest, request: Request):
         )
         extractive_findings: list[str] = []
         for m in matches[:4]:
-            txt = trim_snippet_text((m.get("text") or "").strip(), 220)
-            if not txt:
+            raw = (m.get("text") or "").strip()
+            if not raw or is_raw_fragment(raw):
                 continue
-            md = m.get("metadata") or {}
-            tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
-            extractive_findings.append(f"{txt} {tag}")
+            cleaned = sanitize_fragment_to_sentence(raw)
+            txt = trim_snippet_text(cleaned, 220)
+            if txt and not is_raw_fragment(txt):
+                md = m.get("metadata") or {}
+                tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
+                extractive_findings.append(f"{txt} {tag}")
 
         if not extractive_findings:
             extractive_findings = [
-                "No excerpt text was available for this question. Try rephrasing or asking about a different part of the document."
+                "The available source excerpts could not be cleanly summarized. Try rephrasing or asking about a specific aspect of the document."
             ]
 
-        direct_line = "The following points are taken directly from retrieved excerpts in your document."
+        direct_line = (
+            "The AI analysis could not be completed for this question, but the following "
+            "points are drawn from retrieved excerpts in your document."
+        )
         fallback_brief = AskBrief(
             direct_answer=direct_line,
             key_findings=extractive_findings[:4],
             recommended_next_actions=build_dynamic_fallback_actions(query_text, matches)[:4],
+            confidence="Low",
+            evidence_note="This is a source-grounded fallback. AI generation was unavailable for this request.",
         )
 
         return {

@@ -303,12 +303,20 @@ function buildCitationOrder(citations: Citation[]): Map<string, number> {
 function statusHintForInsight(status: InsightModuleStatus): string {
   if (status === "ok") return "";
   if (status === "insufficient_evidence") {
-    return "Limited evidence is available for this module in the current document.";
+    return "Limited evidence — this diagnosis is based on limited source evidence and should be validated with supporting data.";
   }
   if (status === "grounded" || status === "fallback") {
-    return "Grounded from source evidence.";
+    return "Needs validation — this diagnosis is based on limited source evidence and should be validated with supporting data.";
   }
-  return "This module could not be fully assembled for this run.";
+  return "This module could not be fully assembled for this run. Try regenerating or ask a follow-up question.";
+}
+
+function statusBadgeLabel(status: InsightModuleStatus): string | null {
+  if (status === "ok") return null;
+  if (status === "insufficient_evidence") return "Limited evidence";
+  if (status === "grounded" || status === "fallback") return "Needs validation";
+  if (status === "failed") return "Unavailable";
+  return null;
 }
 
 function deriveFileType(filename?: string) {
@@ -865,7 +873,12 @@ export default function Home() {
             <>
               <article className={`insight-hero tone-${selectedTab.tone}`}>
                 <div className="insight-hero-main">
-                  <p className="hero-tag">Primary Insight</p>
+                  <div className="hero-tag-row">
+                    <p className="hero-tag">Primary Insight</p>
+                    {statusBadgeLabel(selectedInsight.status) && (
+                      <span className="limited-evidence-badge">{statusBadgeLabel(selectedInsight.status)}</span>
+                    )}
+                  </div>
                   <h2>{selectedInsight.title}</h2>
                   <p>{renderTextWithCitationChips(selectedInsight.direct_answer || selectedInsight.summary, selectedCitationOrder)}</p>
                   {statusHintForInsight(selectedInsight.status) && (
