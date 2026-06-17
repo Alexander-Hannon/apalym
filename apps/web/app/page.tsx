@@ -55,11 +55,13 @@ type AskResp = {
   request_id: string;
   query: string;
   answer?: string;
-  answer_mode?: "rag" | "extractive";
+  answer_mode?: "rag" | "extractive" | "advisor";
   brief?: {
     direct_answer: string;
     key_findings: string[];
     recommended_next_actions: string[];
+    confidence?: string | null;
+    evidence_note?: string | null;
   };
   citations?: Citation[];
   matches?: RetrievalMatch[];
@@ -339,6 +341,7 @@ export default function Home() {
   const [loginField, setLoginField] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
+  const [docsOpen, setDocsOpen] = useState(false);
   const [lastRequestId, setLastRequestId] = useState<string | null>(null);
   const [lastTenantId, setLastTenantId] = useState<string | null>(null);
 
@@ -764,7 +767,7 @@ export default function Home() {
             <span className="nav-icon">💬</span>
             Ask Follow-up
           </button>
-          <button className="nav-item" type="button" onClick={() => jumpToSection("upload")}>
+          <button className={`nav-item ${docsOpen ? "active-soft" : ""}`} type="button" onClick={() => setDocsOpen((o) => !o)}>
             <span className="nav-icon">📄</span>
             Documents
           </button>
@@ -934,7 +937,7 @@ export default function Home() {
         <section className="glass-card ask-card" ref={askSectionRef}>
           <div className="ask-head">
             <h2>Follow-up Q&A</h2>
-            <p>Ask deeper questions without leaving the executive brief context.</p>
+            <p>Ask Apalym to explain, prioritize, or turn recommendations into next steps.</p>
           </div>
 
           <div className="ask-row">
@@ -969,7 +972,7 @@ export default function Home() {
                     <h3>Answer</h3>
                     {answerMode && (
                       <span className={`answer-mode ${answerMode}`}>
-                        {answerMode === "rag" ? "AI-grounded" : "Source-grounded"}
+                        {answerMode === "advisor" ? "Document-informed advisor" : answerMode === "rag" ? "AI-grounded" : "Source-grounded"}
                       </span>
                     )}
                   </div>
@@ -977,9 +980,13 @@ export default function Home() {
                     {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
                   </p>
 
+                  {briefFromServer?.evidence_note && (
+                    <p className="evidence-note">{briefFromServer.evidence_note}</p>
+                  )}
+
                   <div className="ask-details-grid">
                     <section>
-                      <h4>Key Findings</h4>
+                      <h4>Source-backed Findings</h4>
                       <ul>
                         {insightBrief.keyFindings.map((finding, index) => (
                           <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
@@ -988,7 +995,7 @@ export default function Home() {
                     </section>
 
                     <section>
-                      <h4>Recommended Actions</h4>
+                      <h4>Advisor Recommendations</h4>
                       <ul>
                         {insightBrief.recommendedActions.map((action, index) => (
                           <li key={index}>{action}</li>
@@ -1024,6 +1031,36 @@ export default function Home() {
             </div>
           )}
         </section>
+
+        {docsOpen && (
+          <section className="glass-card docs-panel" aria-label="Documents">
+            <h3>Current Document</h3>
+            {!doc ? (
+              <p className="docs-empty">No document uploaded yet. Upload a PDF, CSV, or XLSX to get started.</p>
+            ) : (
+              <div className="docs-info">
+                <dl className="debug-dl">
+                  <div><dt>Filename</dt><dd>{doc.filename}</dd></div>
+                  <div><dt>Type</dt><dd>{deriveFileType(doc.filename)}</dd></div>
+                  <div><dt>Document ID</dt><dd>{doc.doc_id.slice(0, 12)}…</dd></div>
+                  <div><dt>Indexed chunks</dt><dd>{indexed?.num_chunks ?? "—"}</dd></div>
+                  <div><dt>Status</dt><dd>{indexed ? "Indexed & brief-ready" : "Uploaded"}</dd></div>
+                </dl>
+                <div className="docs-actions">
+                  <button type="button" className="ghost-btn" onClick={() => { resetForNewUpload(); openFilePicker(); setDocsOpen(false); }}>
+                    Replace Document
+                  </button>
+                  {indexed && (
+                    <button type="button" className="primary-btn" disabled={busy !== null} onClick={() => { fetchInsights(indexed.doc_id); setDocsOpen(false); }}>
+                      Regenerate Brief
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            <p className="docs-note">Full document library coming in a future release.</p>
+          </section>
+        )}
 
         {debugOpen && (
           <section className="glass-card debug-panel" aria-label="Diagnostics">

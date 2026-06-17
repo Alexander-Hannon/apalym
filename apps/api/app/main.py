@@ -457,6 +457,8 @@ class AskBrief(BaseModel):
     direct_answer: str
     key_findings: list[str]
     recommended_next_actions: list[str]
+    confidence: Optional[str] = None
+    evidence_note: Optional[str] = None
 
 class InsightModuleBrief(BaseModel):
     summary: str
@@ -610,14 +612,26 @@ INFERRED_RISK_BULLETS = {
 }
 
 
+def sanitize_fragment_to_sentence(raw: str) -> str:
+    cleaned = compact_whitespace(raw)
+    cleaned = re.sub(r"\b(Medium|Low|High)\s+(Medium|Low|High)\b", r"\1", cleaned)
+    cleaned = re.sub(r"\s+(\.\s*)+", ". ", cleaned)
+    cleaned = re.sub(r"^\W+", "", cleaned)
+    if cleaned and cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    if cleaned and cleaned[-1] not in ".!?":
+        cleaned = cleaned.rstrip(",;: ") + "."
+    return cleaned
+
+
 def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]], module_id: str = "") -> InsightModuleBrief:
     if not matches:
         inferred = INFERRED_RISK_BULLETS.get(module_id, INFERRED_RISK_BULLETS.get("key-risks", []))
         summary = (
-            f"No explicit evidence for '{module_title}' was identified in the source material. "
-            "The following are common inferred considerations for this category."
+            f"The document does not provide a complete view of '{module_title}', "
+            "but the following areas typically deserve leadership review in this category."
         )
-        findings = [f"{bullet} (inferred — not cited in document)" for bullet in inferred]
+        findings = [f"{bullet} (inferred — not directly cited in document)." for bullet in inferred]
         return InsightModuleBrief(
             summary=summary,
             direct_answer=summary,
@@ -625,6 +639,7 @@ def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any
             recommended_actions=[
                 "Request the underlying data source (e.g. general ledger, trial balance) to validate inferred items.",
                 "Flag inferred items for the next management review cycle as discussion topics.",
+                "Re-run analysis when more documentation is available.",
             ],
         )
 
@@ -632,12 +647,14 @@ def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any
     for match in matches[:4]:
         md = match.get("metadata") or {}
         citation_tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
-        excerpt = trim_snippet_text((match.get("text") or "").strip(), 180)
+        raw_text = (match.get("text") or "").strip()
+        sentence = sanitize_fragment_to_sentence(raw_text)
+        excerpt = trim_snippet_text(sentence, 200)
         if excerpt:
             findings.append(f"{excerpt} {citation_tag}")
 
     if not findings:
-        no_excerpt = f"Evidence was retrieved for '{module_title}', but excerpts were empty."
+        no_excerpt = f"Evidence was retrieved for '{module_title}', but excerpts could not be synthesized."
         findings = [no_excerpt]
 
     summary = findings[0]
@@ -649,8 +666,21 @@ def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any
         recommended_actions=[
             "Investigate the highest-impact cited item first and assign an owner with a target metric.",
             "Validate root causes against source evidence and define a 30-day remediation plan.",
+            "Build a risk/cost tracker to monitor progress against identified items.",
         ],
     )
+
+def is_raw_fragment(text: str) -> bool:
+    words = text.split()
+    if len(words) < 4:
+        return True
+    if text.count("  ") > 2:
+        return True
+    repeated = re.search(r"\b(Medium|Low|High)\s+\1\b", text, re.IGNORECASE)
+    if repeated:
+        return True
+    return False
+
 
 def merge_insight_brief_with_fallback(
     parsed_brief: InsightModuleBrief | None,
@@ -664,10 +694,17 @@ def merge_insight_brief_with_fallback(
     key_findings = clean_brief_list_items(parsed_brief.key_findings, fallback.key_findings)
     recommended_actions = clean_brief_list_items(parsed_brief.recommended_actions, fallback.recommended_actions)
 
+    sanitized_findings = []
+    for finding in key_findings:
+        if is_raw_fragment(finding):
+            sanitized_findings.append(sanitize_fragment_to_sentence(finding))
+        else:
+            sanitized_findings.append(finding)
+
     return InsightModuleBrief(
-        summary=summary,
-        direct_answer=direct_answer,
-        key_findings=key_findings[:4],
+        summary=summary if not is_raw_fragment(summary) else sanitize_fragment_to_sentence(summary),
+        direct_answer=direct_answer if not is_raw_fragment(direct_answer) else sanitize_fragment_to_sentence(direct_answer),
+        key_findings=sanitized_findings[:4],
         recommended_actions=recommended_actions[:4],
     )
 
@@ -1556,13 +1593,14 @@ def generate_insights(req: InsightsRequest, request: Request):
             "Rules:\n"
             "- summary: one concise diagnosis sentence grounded in evidence with citations [doc_id:chunk_id]\n"
             "- direct_answer: direct executive-level answer for this module with citations [doc_id:chunk_id]\n"
-            "- key_findings: 2-4 specific findings, each with citations [doc_id:chunk_id]\n"
+            "- key_findings: 2-4 specific findings as COMPLETE, READABLE sentences with citations\n"
             "- recommended_actions: 2-4 concrete, non-generic business actions tied to findings\n"
             "- If evidence is limited or indirect, still provide a best-effort executive analysis.\n"
-            "  Infer plausible risks, cost drivers, or opportunities from whatever context is available.\n"
-            "  Label inferred items with 'Confidence: Low' or 'Inferred' so the reader knows.\n"
+            "  Infer plausible items from context and label them with 'Confidence: Low'.\n"
             "- NEVER say 'the document does not mention' or 'no information available'.\n"
-            "  Instead, provide thoughtful inferred analysis and flag the confidence level."
+            "- NEVER copy raw text fragments. Always rewrite source text as clean executive prose.\n"
+            "- NEVER include broken sentences, unexplained abbreviations, or repeated words like 'Medium Medium'.\n"
+            "- Each finding must be a complete, grammatically correct sentence that an executive can read."
         )
         module_prompt = (
             f"Module: {module_title}\n"
@@ -1739,34 +1777,40 @@ def ask(req: AskRequest, request: Request):
     context_block = "\n\n---\n\n".join(snippets)
 
     system_instruction = (
-        "You are a document-informed business advisor with executive judgment.\n"
-        "Use the provided document excerpts as your primary evidence base.\n"
-        "When you use a fact from the excerpts, include the citation tag like [doc_id:chunk_id].\n\n"
-        "For factual questions: ground your answer in the excerpts with citations.\n"
-        "For implementation, strategy, or 'how should I' questions: use the document context\n"
-        "as a starting point, then layer in practical business reasoning, best-practice\n"
-        "recommendations, and executive judgment. Clearly distinguish document-sourced facts\n"
-        "(with citations) from your advisory recommendations.\n\n"
-        "NEVER say 'the document does not discuss' or 'I cannot find that'.\n"
-        "Instead, provide thoughtful, actionable guidance informed by whatever context is available."
+        "You are Apalym, an executive business advisor for SMB operators.\n"
+        "Use the uploaded document excerpts as your grounding context.\n"
+        "When the document directly supports a claim, cite it with [doc_id:chunk_id].\n\n"
+        "If the user asks for implementation guidance, next steps, strategy, prioritization,\n"
+        "or 'how do I do this', you MAY provide reasonable business recommendations that go\n"
+        "beyond the literal document text. Clearly separate source-backed facts (with citations)\n"
+        "from your advisor recommendations.\n\n"
+        "NEVER say 'the document does not mention this' or 'I cannot find specific instructions'\n"
+        "as the main answer. If evidence is limited, say something like:\n"
+        "'The document does not provide a full implementation plan, but based on the issues\n"
+        "it identifies, here is a practical approach:'\n\n"
+        "Keep every answer useful, executive, and action-oriented."
     )
 
     user_prompt = (
         f"Question: {query_text}\n\n"
         f"Document excerpts:\n{context_block}\n\n"
-        "Provide an executive-quality answer. Cite document evidence where available.\n"
-        "For advisory or implementation questions, add practical recommendations and next steps."
+        "Provide a helpful executive answer. For 'how' questions, give a practical plan.\n"
+        "Cite document evidence where available. Add advisor recommendations beyond the doc if useful."
     )
 
     brief_instruction = (
-        "Return JSON with keys: direct_answer, key_findings, recommended_next_actions.\n"
+        "Return ONLY valid JSON with keys: direct_answer, key_findings, recommended_next_actions, confidence, evidence_note.\n"
         "Rules:\n"
-        "- direct_answer: one concise executive answer. Cite document evidence with [doc_id:chunk_id] where applicable.\n"
-        "- key_findings: 2-4 concrete findings. Cite document evidence where available; advisory points are also welcome.\n"
-        "- recommended_next_actions: 2-4 specific operational/business next steps tailored to the question and evidence.\n"
-        "  These should be practical and implementation-ready, not generic filler.\n"
-        "- Do NOT output generic filler like 'validate answer' or 'ask follow-up'\n"
-        "- Return ONLY valid JSON"
+        "- direct_answer: one concise, helpful executive answer. Cite with [doc_id:chunk_id] where applicable.\n"
+        "  NEVER start with 'I cannot find' or 'The document does not provide'.\n"
+        "- key_findings: 2-4 bullet points. Source-backed observations should include citations.\n"
+        "  Advisory points that go beyond the document are welcome and should be clearly phrased as recommendations.\n"
+        "- recommended_next_actions: 2-4 specific, practical, implementation-ready steps.\n"
+        "  These should directly answer the user's question. If they asked 'how do I do this', answer with concrete steps.\n"
+        "  Do NOT output generic filler like 'validate answer', 'ask follow-up', or 'review sources'.\n"
+        "- confidence: 'High' if answer is well-supported by document, 'Medium' if partially supported, 'Low' if mostly advisory.\n"
+        "- evidence_note: one sentence explaining what is directly supported by the document vs inferred/advised.\n"
+        "- Return ONLY valid JSON, no markdown fences."
     )
 
     # 3) Generate answer (Gemini)
@@ -1861,6 +1905,11 @@ def ask(req: AskRequest, request: Request):
 
     final_brief = merge_brief_with_fallback(query_text, answer, parsed_brief, matches)
 
+    if not final_brief.confidence and parsed_brief and parsed_brief.confidence:
+        final_brief.confidence = parsed_brief.confidence
+    if not final_brief.evidence_note and parsed_brief and parsed_brief.evidence_note:
+        final_brief.evidence_note = parsed_brief.evidence_note
+
     answer = final_brief.direct_answer
 
     # Extract token usage if the SDK exposes it
@@ -1904,7 +1953,7 @@ def ask(req: AskRequest, request: Request):
         "tenant_id": tenant_id,
         "query": req.query,
         "answer": answer,
-        "answer_mode": "rag",
+        "answer_mode": "advisor",
         "citations": citations,
         "matches": matches,  # keep for debugging/UI “sources panel”
     }
@@ -1913,6 +1962,8 @@ def ask(req: AskRequest, request: Request):
         "direct_answer": final_brief.direct_answer,
         "key_findings": final_brief.key_findings,
         "recommended_next_actions": final_brief.recommended_next_actions,
+        "confidence": final_brief.confidence,
+        "evidence_note": final_brief.evidence_note,
     }
 
     return response_payload
