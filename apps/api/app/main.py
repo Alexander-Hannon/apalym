@@ -690,24 +690,41 @@ _GENERIC_FALLBACK_COPY: dict[str, Any] = {
 }
 
 
-def is_raw_fragment(text: str) -> bool:
+_BROKEN_LEADING_SUFFIXES = re.compile(
+    r"^(ductivity|tional|holds|ant\b|ment\b|cy\b|ing\b|ed\b|ion\b|ance\b|tive\b"
+    r"|ation\b|nagement|d\s+dock|s,\s|nt\b|al\b)\s",
+    re.IGNORECASE,
+)
+
+
+def looks_like_raw_or_broken(text: str) -> bool:
     if not text or not text.strip():
         return True
-    words = text.split()
+    t = compact_whitespace(text)
+    words = t.split()
     if len(words) < 5:
         return True
-    if re.search(r"\b(Medium|Low|High)\s+(Medium|Low|High)\b", text, re.IGNORECASE):
+    if _BROKEN_LEADING_SUFFIXES.match(t):
         return True
-    pct_count = text.count("%")
-    dollar_count = text.count("$")
-    if pct_count + dollar_count >= 4 and len(words) < 20:
+    if re.search(r"\b(Medium|Low|High|Miss|Growth|Expected)\s+(Medium|Low|High|Persistent|Growth|management)\b", t, re.IGNORECASE):
         return True
-    if re.search(r"^\s*\w{1,3}\s", text) and not re.match(r"^(The|A|An|It|If|No|In)\s", text, re.IGNORECASE):
+    if re.search(r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", t, re.IGNORECASE):
         return True
-    if text.count("\t") >= 2:
+    pct_count = t.count("%")
+    dollar_count = t.count("$")
+    if pct_count >= 3 and len(words) < 25:
         return True
-    non_alpha = sum(1 for c in text if not c.isalpha() and not c.isspace())
-    if len(text) > 0 and non_alpha / len(text) > 0.35:
+    if pct_count + dollar_count >= 4 and len(words) < 25:
+        return True
+    if t.count("\t") >= 2:
+        return True
+    non_alpha = sum(1 for c in t if not c.isalpha() and not c.isspace())
+    if len(t) > 10 and non_alpha / len(t) > 0.30:
+        return True
+    if len(words) > 18 and not re.search(r"[.!?,;:]", t):
+        return True
+    first_word = words[0].rstrip(".,;:")
+    if len(first_word) <= 3 and first_word[0].islower() and first_word not in ("a", "an", "as", "at", "be", "by", "do", "go", "if", "in", "is", "it", "no", "of", "on", "or", "so", "to", "up", "us", "we"):
         return True
     return False
 
@@ -759,21 +776,23 @@ def merge_insight_brief_with_fallback(
     key_findings = clean_brief_list_items(parsed_brief.key_findings, fallback.key_findings)
     recommended_actions = clean_brief_list_items(parsed_brief.recommended_actions, fallback.recommended_actions)
 
-    if is_raw_fragment(summary):
+    if looks_like_raw_or_broken(summary):
         summary = fallback.summary
-    if is_raw_fragment(direct_answer):
+    if looks_like_raw_or_broken(direct_answer):
         direct_answer = fallback.direct_answer
 
     sanitized_findings = []
     for finding in key_findings:
-        if is_raw_fragment(finding):
+        if looks_like_raw_or_broken(finding):
             sanitized_findings.append(sanitize_fragment_to_sentence(finding))
         else:
             sanitized_findings.append(finding)
 
-    any_still_bad = any(is_raw_fragment(f) for f in sanitized_findings)
-    if any_still_bad:
+    if any(looks_like_raw_or_broken(f) for f in sanitized_findings):
         sanitized_findings = fallback.key_findings
+
+    if any(looks_like_raw_or_broken(a) for a in recommended_actions):
+        recommended_actions = fallback.recommended_actions
 
     return InsightModuleBrief(
         summary=summary,
@@ -1532,6 +1551,64 @@ def _neutral_insight_unavailable_copy() -> str:
     )
 
 
+def enforce_module_quality_gate(
+    module: dict[str, Any],
+    request_id: str,
+    tenant_id: str,
+    doc_id: str,
+) -> dict[str, Any]:
+    """Final quality gate: prevents raw retrieved fragments from reaching pilot
+    users even when LLM marks output as generated."""
+    module_id = module.get("module_id", "")
+    copy = MODULE_FALLBACK_COPY.get(module_id, _GENERIC_FALLBACK_COPY)
+    fields_replaced: list[str] = []
+
+    da = module.get("direct_answer", "")
+    if looks_like_raw_or_broken(da):
+        module["direct_answer"] = copy["direct_answer"] + " Confidence: Low. Based on limited source evidence that should be validated with supporting data."
+        fields_replaced.append("direct_answer")
+
+    summary = module.get("summary", "")
+    if looks_like_raw_or_broken(summary):
+        module["summary"] = module["direct_answer"]
+        fields_replaced.append("summary")
+
+    kf = module.get("key_findings", [])
+    any_finding_bad = any(looks_like_raw_or_broken(f) for f in kf)
+    if any_finding_bad:
+        module["key_findings"] = copy["key_findings"][:4]
+        fields_replaced.append("key_findings")
+
+    ra = module.get("recommended_actions", [])
+    any_action_bad = any(looks_like_raw_or_broken(a) for a in ra)
+    if any_action_bad or (fields_replaced and "key_findings" in fields_replaced):
+        module["recommended_actions"] = copy["recommended_actions"][:4]
+        if "recommended_actions" not in fields_replaced:
+            fields_replaced.append("recommended_actions")
+
+    if fields_replaced:
+        original_status = module.get("status", "unknown")
+        module["status"] = "grounded"
+
+        log_json(
+            level="INFO",
+            event="insight_module_quality_gate_applied",
+            service="api",
+            request_id=request_id,
+            tenant_id=tenant_id,
+            doc_id_filter=doc_id,
+            module_id=module_id,
+            module_title=module.get("title", ""),
+            original_module_llm_status=original_status,
+            new_module_llm_status="grounded",
+            fields_replaced=fields_replaced,
+            fallback_reason="final_quality_gate",
+            confidence="Low",
+        )
+
+    return module
+
+
 def _insight_module_for_response(module: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in module.items() if key != "error"}
 
@@ -1811,6 +1888,10 @@ def generate_insights(req: InsightsRequest, request: Request):
         llm_model=model_name,
     )
 
+    # Final quality gate: every module must pass before reaching the frontend.
+    for m in module_results:
+        enforce_module_quality_gate(m, request_id, tenant_id, doc_id)
+
     client_modules = [_insight_module_for_response(m) for m in module_results]
 
     return {
@@ -1933,11 +2014,11 @@ def ask(req: AskRequest, request: Request):
         extractive_findings: list[str] = []
         for m in matches[:4]:
             raw = (m.get("text") or "").strip()
-            if not raw or is_raw_fragment(raw):
+            if not raw or looks_like_raw_or_broken(raw):
                 continue
             cleaned = sanitize_fragment_to_sentence(raw)
             txt = trim_snippet_text(cleaned, 220)
-            if txt and not is_raw_fragment(txt):
+            if txt and not looks_like_raw_or_broken(txt):
                 md = m.get("metadata") or {}
                 tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
                 extractive_findings.append(f"{txt} {tag}")
