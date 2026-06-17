@@ -159,6 +159,24 @@ function cleanExecutiveActionText(text: string): string {
   return stripRawUuidCitationNoise(text).replace(/\[[^\]]*:[^\]]*\]/g, "").replace(/\s{2,}/g, " ").trim();
 }
 
+function looksLikeRawFragment(text: string): boolean {
+  if (!text || text.trim().length < 15) return false;
+  if (/^(ductivity|tional|holds|ant\b|ment\b|d\s+dock|nagement)/i.test(text.trim())) return true;
+  if (/\b(Medium|High|Low)\s+(Medium|High|Low|Persistent|Growth)\b/i.test(text)) return true;
+  if (/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}/i.test(text)) return true;
+  const pcts = (text.match(/%/g) || []).length;
+  const dollars = (text.match(/\$/g) || []).length;
+  if (pcts >= 3 && text.split(/\s+/).length < 25) return true;
+  if (pcts + dollars >= 4 && text.split(/\s+/).length < 25) return true;
+  return false;
+}
+
+function safeDisplayText(text: string, fallback: string): string {
+  if (!text) return fallback;
+  if (looksLikeRawFragment(text)) return fallback;
+  return text;
+}
+
 function splitSentences(text: string) {
   return text
     .split(/(?<=[.!?])\s+/)
@@ -880,7 +898,7 @@ export default function Home() {
                     )}
                   </div>
                   <h2>{selectedInsight.title}</h2>
-                  <p>{renderTextWithCitationChips(selectedInsight.direct_answer || selectedInsight.summary, selectedCitationOrder)}</p>
+                  <p>{renderTextWithCitationChips(safeDisplayText(selectedInsight.direct_answer || selectedInsight.summary, "This module could not produce a clean diagnosis from the available document. Please regenerate or upload supporting detail."), selectedCitationOrder)}</p>
                   {statusHintForInsight(selectedInsight.status) && (
                     <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
                   )}
@@ -896,18 +914,22 @@ export default function Home() {
                 <section className="detail-panel findings-panel">
                   <h3>Key Findings</h3>
                   <ul>
-                    {selectedInsight.key_findings.map((finding, index) => (
-                      <li key={index}>{renderTextWithCitationChips(finding, selectedCitationOrder)}</li>
-                    ))}
+                    {selectedInsight.key_findings.map((finding, index) =>
+                      looksLikeRawFragment(finding) ? null : (
+                        <li key={index}>{renderTextWithCitationChips(finding, selectedCitationOrder)}</li>
+                      )
+                    )}
                   </ul>
                 </section>
 
                 <section className="detail-panel actions-panel">
                   <h3>Recommended Actions</h3>
                   <ul>
-                    {selectedInsight.recommended_actions.map((action, index) => (
-                      <li key={index}>{cleanExecutiveActionText(action)}</li>
-                    ))}
+                    {selectedInsight.recommended_actions.map((action, index) =>
+                      looksLikeRawFragment(action) ? null : (
+                        <li key={index}>{cleanExecutiveActionText(action)}</li>
+                      )
+                    )}
                   </ul>
                 </section>
 
