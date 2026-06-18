@@ -776,7 +776,98 @@ _UUID_LIKE_PATTERN = re.compile(
     r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b",
     re.IGNORECASE,
 )
-_SOURCE_TAG_PATTERN = re.compile(r"\[[^\]]+:[^\]]+\]")
+_BRACKETED_CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
+_NUMERIC_CITATION_PATTERN = re.compile(r"^\d{1,2}$")
+
+
+def _citation_token_key(value: Any) -> str:
+    token = compact_whitespace(str(value or "")).strip("[]")
+    token = re.sub(r"^source:", "", token, flags=re.IGNORECASE)
+    return token.replace(" ", "").lower()
+
+
+def _citation_lookup(citations: list[dict[str, Any]]) -> dict[str, int]:
+    lookup: dict[str, int] = {}
+    for index, citation in enumerate(citations, start=1):
+        if not isinstance(citation, dict):
+            continue
+        candidates = [
+            citation.get("source_id"),
+            citation.get("doc_id"),
+            citation.get("chunk_id"),
+        ]
+        if citation.get("doc_id") and citation.get("chunk_id"):
+            candidates.append(f"{citation.get('doc_id')}:{citation.get('chunk_id')}")
+        if citation.get("source_id"):
+            candidates.append(f"source:{citation.get('source_id')}")
+        for candidate in candidates:
+            key = _citation_token_key(candidate)
+            if key and key not in lookup:
+                lookup[key] = index
+    return lookup
+
+
+def _looks_like_raw_citation_token(token: str) -> bool:
+    key = _citation_token_key(token)
+    if not key or _NUMERIC_CITATION_PATTERN.fullmatch(key):
+        return False
+    if _UUID_LIKE_PATTERN.search(key):
+        return True
+    if key.startswith(("source_", "chunk_", "doc_")):
+        return True
+    if ":" in key and not re.search(r"\s", key):
+        return True
+    return False
+
+
+def normalize_visible_citations(text: str, citations: list[dict[str, Any]] | None = None) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+
+    sources = citations or []
+    source_count = len(sources)
+    lookup = _citation_lookup(sources)
+    fallback_numbers: dict[str, int] = {}
+    next_number = 1
+
+    def number_for_token(token: str) -> int | None:
+        nonlocal next_number
+        key = _citation_token_key(token)
+        if not key:
+            return None
+        if _NUMERIC_CITATION_PATTERN.fullmatch(key):
+            return int(key)
+        if key in lookup:
+            return lookup[key]
+        if source_count == 0:
+            return None
+        if key not in fallback_numbers:
+            fallback_numbers[key] = min(next_number, source_count)
+            next_number += 1
+        return fallback_numbers[key]
+
+    def replace_bracket(match: re.Match[str]) -> str:
+        content = match.group(1)
+        parts = [part.strip() for part in content.split(",") if part.strip()]
+        if not parts:
+            return ""
+        if not any(_looks_like_raw_citation_token(part) for part in parts):
+            return match.group(0)
+
+        numbers: list[int] = []
+        for part in parts:
+            citation_number = number_for_token(part)
+            if citation_number is not None and citation_number not in numbers:
+                numbers.append(citation_number)
+
+        if not numbers:
+            return ""
+        return ", ".join(f"[{number}]" for number in numbers)
+
+    cleaned = _BRACKETED_CITATION_PATTERN.sub(replace_bracket, text)
+    cleaned = re.sub(r"(\[\d{1,2}\])(?:\s+\1)+", r"\1", cleaned)
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    return compact_whitespace(cleaned)
 
 
 def _has_generic_placeholder(text: str) -> bool:
@@ -808,21 +899,21 @@ def contains_raw_output_pattern(text: str) -> bool:
     )
 
 
-def _clean_module_text(value: Any) -> str:
+def _clean_module_text(value: Any, citations: list[dict[str, Any]] | None = None) -> str:
     if not isinstance(value, str):
         return ""
-    cleaned = _SOURCE_TAG_PATTERN.sub("", value)
+    cleaned = normalize_visible_citations(value, citations)
     cleaned = strip_markdown_emphasis(cleaned).lstrip("-• ").strip()
     cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     return compact_whitespace(cleaned)
 
 
-def _clean_module_list(value: Any) -> list[str]:
+def _clean_module_list(value: Any, citations: list[dict[str, Any]] | None = None) -> list[str]:
     if not isinstance(value, list):
         return []
     cleaned: list[str] = []
     for item in value:
-        text = _clean_module_text(item)
+        text = _clean_module_text(item, citations)
         if text:
             cleaned.append(text)
     return cleaned
@@ -883,13 +974,36 @@ def build_category_fallback(normalized_key: str, module_result: dict[str, Any] |
 
 def minimally_clean_module(module_result: dict[str, Any]) -> dict[str, Any]:
     cleaned = {key: value for key, value in module_result.items() if not key.startswith("_finalize_")}
-    cleaned["summary"] = _clean_module_text(cleaned.get("summary")) or _clean_module_text(cleaned.get("direct_answer"))
-    cleaned["direct_answer"] = _clean_module_text(cleaned.get("direct_answer"))
-    cleaned["key_findings"] = _clean_module_list(cleaned.get("key_findings"))
-    cleaned["recommended_actions"] = _clean_module_list(cleaned.get("recommended_actions"))
+    citations = cleaned.get("citations") if isinstance(cleaned.get("citations"), list) else []
+    cleaned["summary"] = _clean_module_text(cleaned.get("summary"), citations) or _clean_module_text(
+        cleaned.get("direct_answer"),
+        citations,
+    )
+    cleaned["direct_answer"] = _clean_module_text(cleaned.get("direct_answer"), citations)
+    cleaned["key_findings"] = _clean_module_list(cleaned.get("key_findings"), citations)
+    cleaned["recommended_actions"] = _clean_module_list(cleaned.get("recommended_actions"), citations)
+    if isinstance(cleaned.get("assumptions"), list):
+        cleaned["assumptions"] = _clean_module_list(cleaned.get("assumptions"), citations)
+    if isinstance(cleaned.get("evidence_note"), str):
+        cleaned["evidence_note"] = _clean_module_text(cleaned.get("evidence_note"), citations)
     if not cleaned["summary"]:
         cleaned["summary"] = cleaned["direct_answer"]
     return cleaned
+
+
+def normalize_module_visible_text(module: dict[str, Any]) -> dict[str, Any]:
+    citations = module.get("citations") if isinstance(module.get("citations"), list) else []
+    normalized = dict(module)
+    for field in ("direct_answer", "summary", "evidence_note"):
+        if isinstance(normalized.get(field), str):
+            normalized[field] = normalize_visible_citations(normalized[field], citations)
+    for field in ("key_findings", "recommended_actions", "assumptions"):
+        if isinstance(normalized.get(field), list):
+            normalized[field] = [
+                normalize_visible_citations(item, citations) if isinstance(item, str) else item
+                for item in normalized[field]
+            ]
+    return normalized
 
 
 def finalize_insight_module(module_key: str, module_result: dict[str, Any]) -> dict[str, Any]:
@@ -2008,7 +2122,8 @@ def generate_insights(req: InsightsRequest, request: Request):
         m["_finalize_request_id"] = request_id
         m["_finalize_tenant_id"] = tenant_id
         m["_finalize_doc_id_filter"] = doc_id
-        finalized_modules.append(finalize_insight_module(m.get("module_id", ""), m))
+        finalized = finalize_insight_module(m.get("module_id", ""), m)
+        finalized_modules.append(normalize_module_visible_text(finalized))
 
     client_modules = [_insight_module_for_response(m) for m in finalized_modules]
 
@@ -2159,6 +2274,15 @@ def ask(req: AskRequest, request: Request):
             confidence="Low",
             evidence_note="This is a source-grounded fallback. AI generation was unavailable for this request.",
         )
+        fallback_brief.direct_answer = normalize_visible_citations(fallback_brief.direct_answer, citations)
+        fallback_brief.key_findings = [
+            normalize_visible_citations(finding, citations) for finding in fallback_brief.key_findings
+        ]
+        fallback_brief.recommended_next_actions = [
+            normalize_visible_citations(action, citations) for action in fallback_brief.recommended_next_actions
+        ]
+        if fallback_brief.evidence_note:
+            fallback_brief.evidence_note = normalize_visible_citations(fallback_brief.evidence_note, citations)
 
         return {
             "ok": True,
@@ -2200,6 +2324,16 @@ def ask(req: AskRequest, request: Request):
         final_brief.confidence = parsed_brief.confidence
     if not final_brief.evidence_note and parsed_brief and parsed_brief.evidence_note:
         final_brief.evidence_note = parsed_brief.evidence_note
+
+    final_brief.direct_answer = normalize_visible_citations(final_brief.direct_answer, citations)
+    final_brief.key_findings = [
+        normalize_visible_citations(finding, citations) for finding in final_brief.key_findings
+    ]
+    final_brief.recommended_next_actions = [
+        normalize_visible_citations(action, citations) for action in final_brief.recommended_next_actions
+    ]
+    if final_brief.evidence_note:
+        final_brief.evidence_note = normalize_visible_citations(final_brief.evidence_note, citations)
 
     answer = final_brief.direct_answer
 
