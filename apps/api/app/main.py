@@ -583,8 +583,14 @@ def merge_brief_with_fallback(
         recommended_next_actions=recommended_actions[:4],
     )
 
+FALLBACK_EVIDENCE_NOTE = (
+    "Needs validation — this diagnosis is based on limited or messy source evidence "
+    "and should be validated with supporting data."
+)
+
 MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
     "losses": {
+        "title": "Where are we losing money?",
         "direct_answer": (
             "The document does not provide enough clean detail to isolate exact loss drivers. "
             "Based on the available evidence, leadership should review likely leakage areas "
@@ -601,8 +607,13 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
             "Assign owners to validate each suspected loss driver with supporting P&L, A/R, labor, refunds, or operations schedules.",
             "Re-run the analysis after uploading supporting detail.",
         ],
+        "confidence": "Low",
+        "evidence_note": FALLBACK_EVIDENCE_NOTE,
+        "module_llm_status": "fallback_polished",
+        "fallback_reason": "module_not_usable",
     },
     "costs": {
+        "title": "Top cost drivers",
         "direct_answer": (
             "The document does not provide enough clean detail to fully isolate cost pressure. "
             "Based on the available evidence, likely cost drivers should be reviewed across "
@@ -619,8 +630,13 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
             "Identify the top three recurring cost drivers by dollar impact.",
             "Assign cost owners and 30-day reduction targets.",
         ],
+        "confidence": "Low",
+        "evidence_note": FALLBACK_EVIDENCE_NOTE,
+        "module_llm_status": "fallback_polished",
+        "fallback_reason": "module_not_usable",
     },
     "risks": {
+        "title": "Key risks",
         "direct_answer": (
             "The document does not provide enough clean detail to create a complete risk register. "
             "Based on the available evidence, leadership should review operational execution, "
@@ -637,8 +653,13 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
             "Prioritize risks by financial impact and time sensitivity.",
             "Review mitigation progress weekly.",
         ],
+        "confidence": "Low",
+        "evidence_note": FALLBACK_EVIDENCE_NOTE,
+        "module_llm_status": "fallback_polished",
+        "fallback_reason": "module_not_usable",
     },
     "margins": {
+        "title": "Margin improvement opportunities",
         "direct_answer": (
             "The document does not provide enough clean detail to calculate precise margin drivers. "
             "Based on the available evidence, leadership should review pricing, discounts, labor, "
@@ -655,8 +676,13 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
             "Compare pricing and discounting against profitability.",
             "Build a 30-day margin improvement action plan.",
         ],
+        "confidence": "Low",
+        "evidence_note": FALLBACK_EVIDENCE_NOTE,
+        "module_llm_status": "fallback_polished",
+        "fallback_reason": "module_not_usable",
     },
     "trends": {
+        "title": "Notable trends or anomalies",
         "direct_answer": (
             "The document does not provide enough clean time-series detail to confirm a trend "
             "with confidence. Based on the available evidence, leadership should monitor "
@@ -673,10 +699,15 @@ MODULE_FALLBACK_COPY: dict[str, dict[str, Any]] = {
             "Track leading indicators weekly.",
             "Re-run the analysis with updated monthly data.",
         ],
+        "confidence": "Low",
+        "evidence_note": FALLBACK_EVIDENCE_NOTE,
+        "module_llm_status": "fallback_polished",
+        "fallback_reason": "module_not_usable",
     },
 }
 
 _GENERIC_FALLBACK_COPY: dict[str, Any] = {
+    "title": "Executive diagnosis",
     "direct_answer": (
         "The document does not provide enough clean detail to make a definitive diagnosis "
         "for this category. Based on the available evidence, leadership should validate "
@@ -692,12 +723,26 @@ _GENERIC_FALLBACK_COPY: dict[str, Any] = {
         "Assign an owner to validate each driver with supporting data.",
         "Set a follow-up review date and re-run the analysis after uploading more detail.",
     ],
+    "confidence": "Low",
+    "evidence_note": FALLBACK_EVIDENCE_NOTE,
+    "module_llm_status": "fallback_polished",
+    "fallback_reason": "module_not_usable",
 }
 
 
-def normalize_module_key(module_id: str, module_title: str = "") -> str:
-    combined = f"{module_id} {module_title}".lower()
-    if "loss" in combined or "leakage" in combined:
+def normalize_module_key(value: str, module_title: str = "") -> str:
+    combined = compact_whitespace(f"{value or ''} {module_title or ''}").lower()
+    if combined in {"losses", "loss", "where are we losing money?", "losing money"}:
+        return "losses"
+    if combined in {"costs", "cost", "top cost drivers", "cost drivers"}:
+        return "costs"
+    if combined in {"risks", "risk", "key risks"}:
+        return "risks"
+    if combined in {"margins", "margin", "margin improvement opportunities"}:
+        return "margins"
+    if combined in {"trends", "trend", "notable trends or anomalies", "anomalies"}:
+        return "trends"
+    if "loss" in combined or "leakage" in combined or "losing money" in combined:
         return "losses"
     if "cost" in combined or "expense" in combined:
         return "costs"
@@ -707,132 +752,206 @@ def normalize_module_key(module_id: str, module_title: str = "") -> str:
         return "margins"
     if "trend" in combined or "anomal" in combined:
         return "trends"
-    return ""
+    return "generic"
 
 
-def get_module_fallback_copy(module_id: str, module_title: str = "") -> dict[str, Any]:
-    key = normalize_module_key(module_id, module_title)
-    return MODULE_FALLBACK_COPY.get(key, _GENERIC_FALLBACK_COPY)
-
-
-def looks_generic_or_low_value_action(text: str) -> bool:
-    low = compact_whitespace(text).lower()
-    generic_phrases = (
-        "investigate the highest-impact cited item",
-        "validate root causes against source evidence",
-        "define a 30-day remediation plan",
-        "review the source evidence",
-        "analyze the document",
-        "build a risk/cost tracker to monitor progress against identified items",
-    )
-    return any(phrase in low for phrase in generic_phrases)
-
-
+_GENERIC_PLACEHOLDER_MARKERS: tuple[tuple[str, ...], ...] = (
+    ("additional detail", "fully assess this finding"),
+    ("validate this area", "relevant department owner"),
+    ("module", "clean diagnosis"),
+    ("regenerate", "upload supporting detail"),
+    ("highest-impact cited item",),
+    ("root causes", "source evidence"),
+    ("could not be assembled", "your document"),
+)
 _BROKEN_LEADING_SUFFIXES = re.compile(
-    r"^(ductivity|tional|holds|ant\b|ment\b|cy\b|ing\b|ed\b|ion\b|ance\b|tive\b"
-    r"|ation\b|nagement|d\s+dock|s,\s|nt\b|al\b)\s",
+    r"^(ductivity|tional|ant\b|holds\b|d\s+dock|ment\b|cy\b)\s",
     re.IGNORECASE,
 )
+_REPEATED_QUALITY_WORDS = re.compile(
+    r"\b(Medium|High|Low|Growth)\s+\1\b",
+    re.IGNORECASE,
+)
+_UUID_LIKE_PATTERN = re.compile(
+    r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b",
+    re.IGNORECASE,
+)
+_SOURCE_TAG_PATTERN = re.compile(r"\[[^\]]+:[^\]]+\]")
 
 
-def looks_like_raw_or_broken(text: str) -> bool:
-    if not text or not text.strip():
-        return True
+def _has_generic_placeholder(text: str) -> bool:
+    low = compact_whitespace(text).lower()
+    return any(all(part in low for part in marker_parts) for marker_parts in _GENERIC_PLACEHOLDER_MARKERS)
+
+
+def _looks_like_table_row_dump(text: str) -> bool:
     t = compact_whitespace(text)
-    words = t.split()
-    if len(words) < 5:
+    label_count = len(re.findall(r"\b[A-Za-z][A-Za-z0-9 /%$&().-]{1,35}:\s*\S", t))
+    if re.match(r"^row\s+\d+[:\s]", t, re.IGNORECASE) and label_count >= 2:
         return True
-    if _BROKEN_LEADING_SUFFIXES.match(t):
+    if label_count >= 3:
         return True
-    if re.search(r"\b(Medium|Low|High|Miss|Growth|Expected)\s+(Medium|Low|High|Persistent|Growth|management)\b", t, re.IGNORECASE):
-        return True
-    if re.search(r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", t, re.IGNORECASE):
-        return True
-    pct_count = t.count("%")
-    dollar_count = t.count("$")
-    if pct_count >= 3 and len(words) < 25:
-        return True
-    if pct_count + dollar_count >= 4 and len(words) < 25:
-        return True
-    if t.count("\t") >= 2:
-        return True
-    non_alpha = sum(1 for c in t if not c.isalpha() and not c.isspace())
-    if len(t) > 10 and non_alpha / len(t) > 0.30:
-        return True
-    if len(words) > 18 and not re.search(r"[.!?,;:]", t):
-        return True
-    first_word = words[0].rstrip(".,;:")
-    if len(first_word) <= 3 and first_word[0].islower() and first_word not in ("a", "an", "as", "at", "be", "by", "do", "go", "if", "in", "is", "it", "no", "of", "on", "or", "so", "to", "up", "us", "we"):
+    if len(t.split()) > 14 and not re.search(r"[.!?]", t) and (t.count("%") + t.count("$") >= 3):
         return True
     return False
 
 
-def sanitize_fragment_to_sentence(raw: str) -> str:
-    cleaned = compact_whitespace(raw)
-    cleaned = re.sub(r"\b(Medium|Low|High)\s+(Medium|Low|High)\b", r"\1", cleaned)
-    cleaned = re.sub(r"\s+(\.\s*)+", ". ", cleaned)
-    cleaned = re.sub(r"^\W+", "", cleaned)
-    cleaned = re.sub(r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = compact_whitespace(cleaned)
-    if cleaned and cleaned[0].islower():
-        cleaned = cleaned[0].upper() + cleaned[1:]
-    if cleaned and cleaned[-1] not in ".!?":
-        cleaned = cleaned.rstrip(",;: ") + "."
+def contains_raw_output_pattern(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    t = compact_whitespace(text)
+    return bool(
+        _BROKEN_LEADING_SUFFIXES.match(t)
+        or _REPEATED_QUALITY_WORDS.search(t)
+        or _UUID_LIKE_PATTERN.search(t)
+        or _looks_like_table_row_dump(t)
+    )
+
+
+def _clean_module_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = _SOURCE_TAG_PATTERN.sub("", value)
+    cleaned = strip_markdown_emphasis(cleaned).lstrip("-• ").strip()
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    return compact_whitespace(cleaned)
+
+
+def _clean_module_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned: list[str] = []
+    for item in value:
+        text = _clean_module_text(item)
+        if text:
+            cleaned.append(text)
     return cleaned
 
 
-def build_insight_module_fallback(module_title: str, matches: list[dict[str, Any]], module_id: str = "") -> InsightModuleBrief:
-    copy = get_module_fallback_copy(module_id, module_title)
+def _module_direct_answer_is_usable(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    cleaned = compact_whitespace(text)
+    return len(cleaned) >= 80 and not _has_generic_placeholder(cleaned) and not contains_raw_output_pattern(cleaned)
 
-    evidence_qualifier = (
-        "Confidence: Low. Based on limited source evidence that should be validated with supporting data."
-        if matches else
-        "Confidence: Low. This assessment is based on general business considerations, not document evidence."
+
+def _module_list_is_usable(items: Any) -> bool:
+    if not isinstance(items, list):
+        return False
+    cleaned = [compact_whitespace(item) for item in items if isinstance(item, str) and compact_whitespace(item)]
+    normalized = [item.lower() for item in cleaned]
+    return bool(
+        len(cleaned) >= 3
+        and len(set(normalized)) == len(normalized)
+        and not any(_has_generic_placeholder(item) or contains_raw_output_pattern(item) for item in cleaned)
     )
-    return InsightModuleBrief(
-        summary=copy["direct_answer"],
-        direct_answer=f"{copy['direct_answer']} {evidence_qualifier}",
-        key_findings=list(copy["key_findings"][:4]),
-        recommended_actions=list(copy["recommended_actions"][:4]),
+
+
+def module_is_usable(module: dict[str, Any]) -> bool:
+    return (
+        _module_direct_answer_is_usable(module.get("direct_answer"))
+        and _module_list_is_usable(module.get("key_findings"))
+        and _module_list_is_usable(module.get("recommended_actions"))
     )
 
 
-def merge_insight_brief_with_fallback(
-    parsed_brief: InsightModuleBrief | None,
-    fallback: InsightModuleBrief,
-) -> InsightModuleBrief:
-    if parsed_brief is None:
-        return fallback
+def build_category_fallback(normalized_key: str, module_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    original = module_result or {}
+    copy = MODULE_FALLBACK_COPY.get(normalized_key, _GENERIC_FALLBACK_COPY)
+    title = original.get("title") if isinstance(original.get("title"), str) else copy["title"]
+    module_id = original.get("module_id") if isinstance(original.get("module_id"), str) else normalized_key
 
-    summary = strip_markdown_emphasis(parsed_brief.summary) or fallback.summary
-    direct_answer = strip_markdown_emphasis(parsed_brief.direct_answer) or fallback.direct_answer
-    key_findings = clean_brief_list_items(parsed_brief.key_findings, fallback.key_findings)
-    recommended_actions = clean_brief_list_items(parsed_brief.recommended_actions, fallback.recommended_actions)
+    fallback = {
+        "module_id": module_id,
+        "title": title,
+        "status": "fallback",
+        "summary": copy["direct_answer"],
+        "direct_answer": copy["direct_answer"],
+        "key_findings": list(copy["key_findings"]),
+        "recommended_actions": list(copy["recommended_actions"]),
+        "citations": original.get("citations") if isinstance(original.get("citations"), list) else [],
+        "matches": original.get("matches") if isinstance(original.get("matches"), list) else [],
+        "confidence": copy["confidence"],
+        "evidence_note": copy["evidence_note"],
+        "module_llm_status": copy["module_llm_status"],
+        "fallback_reason": copy["fallback_reason"],
+    }
+    if original.get("error"):
+        fallback["error"] = original["error"]
+    return fallback
 
-    if looks_like_raw_or_broken(summary):
-        summary = fallback.summary
-    if looks_like_raw_or_broken(direct_answer):
-        direct_answer = fallback.direct_answer
 
-    sanitized_findings = []
-    for finding in key_findings:
-        if looks_like_raw_or_broken(finding):
-            sanitized_findings.append(sanitize_fragment_to_sentence(finding))
-        else:
-            sanitized_findings.append(finding)
+def minimally_clean_module(module_result: dict[str, Any]) -> dict[str, Any]:
+    cleaned = {key: value for key, value in module_result.items() if not key.startswith("_finalize_")}
+    cleaned["summary"] = _clean_module_text(cleaned.get("summary")) or _clean_module_text(cleaned.get("direct_answer"))
+    cleaned["direct_answer"] = _clean_module_text(cleaned.get("direct_answer"))
+    cleaned["key_findings"] = _clean_module_list(cleaned.get("key_findings"))
+    cleaned["recommended_actions"] = _clean_module_list(cleaned.get("recommended_actions"))
+    if not cleaned["summary"]:
+        cleaned["summary"] = cleaned["direct_answer"]
+    return cleaned
 
-    if any(looks_like_raw_or_broken(f) for f in sanitized_findings):
-        sanitized_findings = fallback.key_findings
 
-    if any(looks_like_raw_or_broken(a) for a in recommended_actions):
-        recommended_actions = fallback.recommended_actions
+def finalize_insight_module(module_key: str, module_result: dict[str, Any]) -> dict[str, Any]:
+    normalized_key = normalize_module_key(module_key, module_result.get("title", ""))
+    fallback = build_category_fallback(normalized_key, module_result)
+    cleaned = minimally_clean_module(module_result)
+    original_status = module_result.get("status", "unknown")
 
-    return InsightModuleBrief(
-        summary=summary,
-        direct_answer=direct_answer,
-        key_findings=sanitized_findings[:4],
-        recommended_actions=recommended_actions[:4],
+    direct_answer_usable = _module_direct_answer_is_usable(cleaned.get("direct_answer"))
+    findings_usable = _module_list_is_usable(cleaned.get("key_findings"))
+    actions_usable = _module_list_is_usable(cleaned.get("recommended_actions"))
+
+    direct_answer_preserved = False
+    findings_replaced = False
+    actions_replaced = False
+    whole_module_replaced = False
+    reason = "module_usable"
+
+    if module_is_usable(cleaned):
+        final_module = cleaned
+        direct_answer_preserved = True
+    elif direct_answer_usable:
+        final_module = {
+            **cleaned,
+            "status": "fallback",
+            "summary": cleaned["direct_answer"],
+            "key_findings": fallback["key_findings"],
+            "recommended_actions": fallback["recommended_actions"],
+            "confidence": "Low",
+            "evidence_note": FALLBACK_EVIDENCE_NOTE,
+            "module_llm_status": "fallback_polished",
+            "fallback_reason": "module_not_usable",
+        }
+        direct_answer_preserved = True
+        findings_replaced = True
+        actions_replaced = True
+        reason = "findings_or_actions_not_usable"
+    else:
+        final_module = fallback
+        findings_replaced = True
+        actions_replaced = True
+        whole_module_replaced = True
+        reason = "module_not_usable"
+
+    log_json(
+        level="INFO",
+        event="insight_module_finalized",
+        service="api",
+        request_id=module_result.get("_finalize_request_id"),
+        tenant_id=module_result.get("_finalize_tenant_id"),
+        doc_id_filter=module_result.get("_finalize_doc_id_filter"),
+        module_key=module_key,
+        normalized_module_key=normalized_key,
+        original_status=original_status,
+        final_status=final_module.get("status"),
+        direct_answer_preserved=direct_answer_preserved,
+        findings_replaced=findings_replaced,
+        actions_replaced=actions_replaced,
+        whole_module_replaced=whole_module_replaced,
+        reason=reason,
     )
+    return final_module
 
 def trim_snippet_text(text: str, max_chars: int) -> str:
     compact = compact_whitespace(text)
@@ -998,18 +1117,14 @@ def generate_insight_module(
         request_id=request_id,
     )
     citations = [m["citation"] for m in matches]
-    fallback = build_insight_module_fallback(title, matches, module_id=module_id)
+    fallback = build_category_fallback(
+        normalize_module_key(module_id, title),
+        {"module_id": module_id, "title": title, "citations": citations, "matches": matches},
+    )
 
     if not matches:
         return {
-            "module_id": module_id,
-            "title": title,
-            "summary": fallback.summary,
-            "direct_answer": fallback.direct_answer,
-            "key_findings": fallback.key_findings,
-            "recommended_actions": fallback.recommended_actions,
-            "citations": citations,
-            "matches": matches,
+            **fallback,
             "status": "no_evidence",
             "error": None,
         }
@@ -1043,18 +1158,27 @@ def generate_insight_module(
             except Exception:
                 parsed_brief = None
 
-        final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback)
+        if parsed_brief is not None:
+            final_brief = {
+                "summary": parsed_brief.summary,
+                "direct_answer": parsed_brief.direct_answer,
+                "key_findings": parsed_brief.key_findings,
+                "recommended_actions": parsed_brief.recommended_actions,
+                "status": "ok",
+            }
+        else:
+            final_brief = {**fallback, "status": "fallback", "error": None}
         return {
             "module_id": module_id,
             "title": title,
-            "summary": final_brief.summary,
-            "direct_answer": final_brief.direct_answer,
-            "key_findings": final_brief.key_findings,
-            "recommended_actions": final_brief.recommended_actions,
+            "summary": final_brief["summary"],
+            "direct_answer": final_brief["direct_answer"],
+            "key_findings": final_brief["key_findings"],
+            "recommended_actions": final_brief["recommended_actions"],
             "citations": citations,
             "matches": matches,
-            "status": "ok",
-            "error": None,
+            "status": final_brief["status"],
+            "error": final_brief.get("error"),
         }
     except Exception as error:
         log_json(
@@ -1070,14 +1194,7 @@ def generate_insight_module(
             detail=str(error)[:500],
         )
         return {
-            "module_id": module_id,
-            "title": title,
-            "summary": fallback.summary,
-            "direct_answer": fallback.direct_answer,
-            "key_findings": fallback.key_findings,
-            "recommended_actions": fallback.recommended_actions,
-            "citations": citations,
-            "matches": matches,
+            **fallback,
             "status": "error",
             "error": f"Module generation failed: {type(error).__name__}",
         }
@@ -1584,64 +1701,6 @@ def _neutral_insight_unavailable_copy() -> str:
     )
 
 
-def enforce_module_quality_gate(
-    module: dict[str, Any],
-    request_id: str,
-    tenant_id: str,
-    doc_id: str,
-) -> dict[str, Any]:
-    """Final quality gate: prevents raw retrieved fragments from reaching pilot
-    users even when LLM marks output as generated. Guarantees non-empty
-    direct_answer, key_findings (>=3), and recommended_actions (>=3)."""
-    module_id = module.get("module_id", "")
-    module_title = module.get("title", "")
-    copy = get_module_fallback_copy(module_id, module_title)
-    fields_replaced: list[str] = []
-
-    da = module.get("direct_answer", "")
-    if not da or looks_like_raw_or_broken(da):
-        module["direct_answer"] = copy["direct_answer"]
-        fields_replaced.append("direct_answer")
-
-    summary = module.get("summary", "")
-    if not summary or looks_like_raw_or_broken(summary):
-        module["summary"] = module["direct_answer"]
-        fields_replaced.append("summary")
-
-    kf = module.get("key_findings") or []
-    if len(kf) < 3 or any(looks_like_raw_or_broken(f) for f in kf):
-        module["key_findings"] = list(copy["key_findings"][:4])
-        fields_replaced.append("key_findings")
-
-    ra = module.get("recommended_actions") or []
-    all_generic = all(looks_generic_or_low_value_action(a) for a in ra) if ra else True
-    if len(ra) < 3 or any(looks_like_raw_or_broken(a) for a in ra) or all_generic:
-        module["recommended_actions"] = list(copy["recommended_actions"][:4])
-        fields_replaced.append("recommended_actions")
-
-    if fields_replaced:
-        original_status = module.get("status", "unknown")
-        module["status"] = "grounded"
-
-        log_json(
-            level="INFO",
-            event="insight_module_quality_gate_applied",
-            service="api",
-            request_id=request_id,
-            tenant_id=tenant_id,
-            doc_id_filter=doc_id,
-            module_id=module_id,
-            module_title=module_title,
-            original_module_llm_status=original_status,
-            new_module_llm_status="grounded",
-            fields_replaced=fields_replaced,
-            fallback_reason="final_quality_gate",
-            confidence="Low",
-        )
-
-    return module
-
-
 def _insight_module_for_response(module: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in module.items() if key != "error"}
 
@@ -1730,7 +1789,10 @@ def generate_insights(req: InsightsRequest, request: Request):
             continue
 
         citations = [m["citation"] for m in matches]
-        fallback_brief = build_insight_module_fallback(module_title, matches, module_id=module_id)
+        fallback_module = build_category_fallback(
+            normalize_module_key(module_id, module_title),
+            {"module_id": module_id, "title": module_title, "citations": citations, "matches": matches},
+        )
 
         if not matches:
             module_results.append(
@@ -1738,12 +1800,16 @@ def generate_insights(req: InsightsRequest, request: Request):
                     "module_id": module_id,
                     "title": module_title,
                     "status": "insufficient_evidence",
-                    "summary": fallback_brief.summary,
-                    "direct_answer": fallback_brief.direct_answer,
-                    "key_findings": fallback_brief.key_findings,
-                    "recommended_actions": fallback_brief.recommended_actions,
+                    "summary": fallback_module["summary"],
+                    "direct_answer": fallback_module["direct_answer"],
+                    "key_findings": fallback_module["key_findings"],
+                    "recommended_actions": fallback_module["recommended_actions"],
                     "citations": citations,
                     "matches": matches,
+                    "confidence": fallback_module["confidence"],
+                    "evidence_note": fallback_module["evidence_note"],
+                    "module_llm_status": "fallback_polished",
+                    "fallback_reason": "module_not_usable",
                 }
             )
             success_count += 1
@@ -1818,25 +1884,37 @@ def generate_insights(req: InsightsRequest, request: Request):
                 except Exception:
                     parsed_brief = None
 
-            final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback_brief)
             if parsed_brief is not None:
                 module_status = "ok"
                 llm_status_log = "generated"
                 fallback_reason = None
+                module_payload = {
+                    "summary": parsed_brief.summary,
+                    "direct_answer": parsed_brief.direct_answer,
+                    "key_findings": parsed_brief.key_findings,
+                    "recommended_actions": parsed_brief.recommended_actions,
+                }
             else:
-                module_status = "grounded"
+                module_status = "fallback"
                 llm_status_log = "fallback_polished"
                 fallback_reason = "json_parse_failed"
+                module_payload = {
+                    "summary": fallback_module["summary"],
+                    "direct_answer": fallback_module["direct_answer"],
+                    "key_findings": fallback_module["key_findings"],
+                    "recommended_actions": fallback_module["recommended_actions"],
+                    "confidence": fallback_module["confidence"],
+                    "evidence_note": fallback_module["evidence_note"],
+                    "module_llm_status": "fallback_polished",
+                    "fallback_reason": "module_not_usable",
+                }
 
             module_results.append(
                 {
                     "module_id": module_id,
                     "title": module_title,
                     "status": module_status,
-                    "summary": final_brief.summary,
-                    "direct_answer": final_brief.direct_answer,
-                    "key_findings": final_brief.key_findings,
-                    "recommended_actions": final_brief.recommended_actions,
+                    **module_payload,
                     "citations": citations,
                     "matches": matches,
                 }
@@ -1880,12 +1958,16 @@ def generate_insights(req: InsightsRequest, request: Request):
                     "title": module_title,
                     "status": "grounded",
                     "error": f"Generation failed: {type(error).__name__}",
-                    "summary": fallback_brief.summary,
-                    "direct_answer": fallback_brief.direct_answer,
-                    "key_findings": fallback_brief.key_findings,
-                    "recommended_actions": fallback_brief.recommended_actions,
+                    "summary": fallback_module["summary"],
+                    "direct_answer": fallback_module["direct_answer"],
+                    "key_findings": fallback_module["key_findings"],
+                    "recommended_actions": fallback_module["recommended_actions"],
                     "citations": citations,
                     "matches": matches,
+                    "confidence": fallback_module["confidence"],
+                    "evidence_note": fallback_module["evidence_note"],
+                    "module_llm_status": "fallback_polished",
+                    "fallback_reason": "module_not_usable",
                 }
             )
             success_count += 1
@@ -1921,11 +2003,14 @@ def generate_insights(req: InsightsRequest, request: Request):
         llm_model=model_name,
     )
 
-    # Final quality gate: every module must pass before reaching the frontend.
+    finalized_modules: list[dict[str, Any]] = []
     for m in module_results:
-        enforce_module_quality_gate(m, request_id, tenant_id, doc_id)
+        m["_finalize_request_id"] = request_id
+        m["_finalize_tenant_id"] = tenant_id
+        m["_finalize_doc_id_filter"] = doc_id
+        finalized_modules.append(finalize_insight_module(m.get("module_id", ""), m))
 
-    client_modules = [_insight_module_for_response(m) for m in module_results]
+    client_modules = [_insight_module_for_response(m) for m in finalized_modules]
 
     return {
         "ok": True,
@@ -2047,11 +2132,13 @@ def ask(req: AskRequest, request: Request):
         extractive_findings: list[str] = []
         for m in matches[:4]:
             raw = (m.get("text") or "").strip()
-            if not raw or looks_like_raw_or_broken(raw):
+            if not raw:
                 continue
-            cleaned = sanitize_fragment_to_sentence(raw)
+            cleaned = _clean_module_text(raw)
+            if not cleaned or contains_raw_output_pattern(cleaned):
+                continue
             txt = trim_snippet_text(cleaned, 220)
-            if txt and not looks_like_raw_or_broken(txt):
+            if txt and not contains_raw_output_pattern(txt):
                 md = m.get("metadata") or {}
                 tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
                 extractive_findings.append(f"{txt} {tag}")
