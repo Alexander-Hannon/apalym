@@ -154,19 +154,6 @@ function stripRawUuidCitationNoise(text: string): string {
     .trim();
 }
 
-function cleanExecutiveActionText(text: string): string {
-  if (!text) return "";
-  return stripRawUuidCitationNoise(text).replace(/\[[^\]]*:[^\]]*\]/g, "").replace(/\s{2,}/g, " ").trim();
-}
-
-function looksLikeRawFragment(text: string): boolean {
-  if (!text || text.trim().length < 15) return false;
-  if (/^(ductivity|tional|holds\s+Financial|d\s+dock|nagement)/i.test(text.trim())) return true;
-  if (/\b(Medium|High|Low)\s+(Medium|High|Low|Persistent)\b/i.test(text)) return true;
-  if (/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}/i.test(text)) return true;
-  return false;
-}
-
 function splitSentences(text: string) {
   return text
     .split(/(?<=[.!?])\s+/)
@@ -475,11 +462,6 @@ export default function Home() {
 
   const selectedInsight = insightsById.get(selectedInsightId);
   const selectedTab = INSIGHT_TABS.find((tab) => tab.moduleId === selectedInsightId) ?? INSIGHT_TABS[0];
-
-  const selectedCitationOrder = useMemo(
-    () => buildCitationOrder(selectedInsight?.citations ?? []),
-    [selectedInsight]
-  );
 
   const selectedMatchesBySource = useMemo(() => {
     const lookup = new Map<string, RetrievalMatch>();
@@ -888,7 +870,7 @@ export default function Home() {
                     )}
                   </div>
                   <h2>{selectedInsight.title}</h2>
-                  <p>{renderTextWithCitationChips(selectedInsight.direct_answer || selectedInsight.summary, selectedCitationOrder)}</p>
+                  <p>{renderInlineMarkdown(selectedInsight.direct_answer, "insight-direct-answer")}</p>
                   {statusHintForInsight(selectedInsight.status) && (
                     <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
                   )}
@@ -903,28 +885,28 @@ export default function Home() {
               <div className="details-grid">
                 <section className="detail-panel findings-panel">
                   <h3>Key Findings</h3>
-                  <ul>
-                    {selectedInsight.key_findings.map((finding, index) => (
-                      <li key={index}>
-                        {looksLikeRawFragment(finding)
-                          ? "Additional detail is needed to fully assess this finding."
-                          : renderTextWithCitationChips(finding, selectedCitationOrder)}
-                      </li>
-                    ))}
-                  </ul>
+                  {selectedInsight.key_findings.length === 0 ? (
+                    <p className="sources-empty">No findings returned for this module.</p>
+                  ) : (
+                    <ul>
+                      {selectedInsight.key_findings.map((finding, index) => (
+                        <li key={index}>{renderInlineMarkdown(finding, `finding-${index}`)}</li>
+                      ))}
+                    </ul>
+                  )}
                 </section>
 
                 <section className="detail-panel actions-panel">
                   <h3>Recommended Actions</h3>
-                  <ul>
-                    {selectedInsight.recommended_actions.map((action, index) => (
-                      <li key={index}>
-                        {looksLikeRawFragment(action)
-                          ? "Validate this area with the relevant department owner."
-                          : cleanExecutiveActionText(action)}
-                      </li>
-                    ))}
-                  </ul>
+                  {selectedInsight.recommended_actions.length === 0 ? (
+                    <p className="sources-empty">No actions returned for this module.</p>
+                  ) : (
+                    <ul>
+                      {selectedInsight.recommended_actions.map((action, index) => (
+                        <li key={index}>{renderInlineMarkdown(action, `action-${index}`)}</li>
+                      ))}
+                    </ul>
+                  )}
                 </section>
 
                 <section className="detail-panel sources-panel">
