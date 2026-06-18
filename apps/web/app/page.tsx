@@ -870,7 +870,7 @@ export default function Home() {
                     )}
                   </div>
                   <h2>{selectedInsight.title}</h2>
-                  <p>{renderInlineMarkdown(selectedInsight.direct_answer, "insight-direct-answer")}</p>
+                  <p>{selectedInsight.direct_answer}</p>
                   {statusHintForInsight(selectedInsight.status) && (
                     <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
                   )}
@@ -890,7 +890,7 @@ export default function Home() {
                   ) : (
                     <ul>
                       {selectedInsight.key_findings.map((finding, index) => (
-                        <li key={index}>{renderInlineMarkdown(finding, `finding-${index}`)}</li>
+                        <li key={index}>{finding}</li>
                       ))}
                     </ul>
                   )}
@@ -903,7 +903,7 @@ export default function Home() {
                   ) : (
                     <ul>
                       {selectedInsight.recommended_actions.map((action, index) => (
-                        <li key={index}>{renderInlineMarkdown(action, `action-${index}`)}</li>
+                        <li key={index}>{action}</li>
                       ))}
                     </ul>
                   )}
