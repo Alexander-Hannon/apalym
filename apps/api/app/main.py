@@ -925,6 +925,7 @@ def clean_source_excerpt(text: str) -> str:
     cleaned = text.replace("\x00", " ")
     cleaned = _RAW_BRACKETED_SOURCE_PATTERN.sub("", cleaned)
     cleaned = _UUID_LIKE_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\[[^\]]*:[^\]]*\]", "", cleaned)
     cleaned = _RAW_INTERNAL_ID_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"```+", "", cleaned)
     cleaned = re.sub(r"(?im)^\s*(csv columns|columns|sheet):.*$", "", cleaned)
