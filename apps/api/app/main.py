@@ -778,6 +778,14 @@ _UUID_LIKE_PATTERN = re.compile(
 )
 _BRACKETED_CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
 _NUMERIC_CITATION_PATTERN = re.compile(r"^\d{1,2}$")
+_RAW_INTERNAL_ID_PATTERN = re.compile(
+    r"\b(?:source:|source_|chunk_|doc_)[A-Za-z0-9_.:-]*",
+    re.IGNORECASE,
+)
+_RAW_BRACKETED_SOURCE_PATTERN = re.compile(
+    r"\[(?:source:)?[A-Za-z0-9_.:-]*(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|chunk_|doc_|source_)[^\]]*\]",
+    re.IGNORECASE,
+)
 
 
 def _citation_token_key(value: Any) -> str:
@@ -870,6 +878,68 @@ def normalize_visible_citations(text: str, citations: list[dict[str, Any]] | Non
     return compact_whitespace(cleaned)
 
 
+def clean_source_excerpt(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = text.replace("\x00", " ")
+    cleaned = _RAW_BRACKETED_SOURCE_PATTERN.sub("", cleaned)
+    cleaned = _UUID_LIKE_PATTERN.sub("", cleaned)
+    cleaned = _RAW_INTERNAL_ID_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"```+", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*(csv columns|columns|sheet):.*$", "", cleaned)
+    cleaned = re.sub(r"(?i)\brow\s+\d+\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"[\r\t]+", " ", cleaned)
+    cleaned = compact_whitespace(cleaned)
+    if not cleaned:
+        return ""
+
+    table_like = _looks_like_table_row_dump(cleaned)
+    if _BROKEN_LEADING_SUFFIXES.match(cleaned):
+        words = cleaned.split()
+        cleaned = " ".join(words[1:]).strip()
+        table_like = True
+
+    if table_like:
+        cleaned = f"Excerpt contains table data. Key values: {cleaned}"
+
+    return trim_snippet_text(cleaned, 520)
+
+
+def _source_confidence_label(score: Any) -> str:
+    if not isinstance(score, (int, float)):
+        return "Evidence"
+    if score >= 0.75:
+        return "High"
+    if score >= 0.55:
+        return "Medium"
+    return "Low"
+
+
+def build_clean_source_packets(retrieved_chunks: list[dict[str, Any]], max_sources: int = 3) -> tuple[list[dict[str, Any]], str]:
+    source_packets: list[dict[str, Any]] = []
+    context_blocks: list[str] = []
+
+    for match in retrieved_chunks[:max_sources]:
+        excerpt = clean_source_excerpt((match.get("text") or "").strip())
+        if not excerpt:
+            continue
+        source_number = len(source_packets) + 1
+        md = match.get("metadata") or {}
+        packet = {
+            "source_number": source_number,
+            "label": f"[{source_number}]",
+            "excerpt": excerpt,
+            "confidence": _source_confidence_label(match.get("score")),
+            "internal_doc_id": md.get("doc_id"),
+            "internal_chunk_id": md.get("chunk_id"),
+            "internal_source_id": match.get("id"),
+        }
+        source_packets.append(packet)
+        context_blocks.append(f"[{source_number}]\n{excerpt}")
+
+    return source_packets, "\n\n".join(context_blocks)
+
+
 def _has_generic_placeholder(text: str) -> bool:
     low = compact_whitespace(text).lower()
     return any(all(part in low for part in marker_parts) for marker_parts in _GENERIC_PLACEHOLDER_MARKERS)
@@ -944,6 +1014,98 @@ def module_is_usable(module: dict[str, Any]) -> bool:
         and _module_list_is_usable(module.get("key_findings"))
         and _module_list_is_usable(module.get("recommended_actions"))
     )
+
+
+_GENERIC_CONTRACT_ACTIONS = (
+    "investigate the highest-impact cited item first",
+    "validate root causes against source evidence",
+    "validate this area with the relevant department owner",
+)
+
+
+def _module_visible_strings(module: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for field in ("direct_answer", "summary", "evidence_note"):
+        value = module.get(field)
+        if isinstance(value, str):
+            values.append(value)
+    for field in ("key_findings", "recommended_actions", "assumptions"):
+        items = module.get(field)
+        if isinstance(items, list):
+            values.extend(item for item in items if isinstance(item, str))
+    return values
+
+
+def _contains_raw_visible_artifact(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    return bool(
+        _UUID_LIKE_PATTERN.search(text)
+        or _RAW_BRACKETED_SOURCE_PATTERN.search(text)
+        or _RAW_INTERNAL_ID_PATTERN.search(text)
+        or re.search(r"\bsource\s*:", text, re.IGNORECASE)
+        or _REPEATED_QUALITY_WORDS.search(text)
+        or _BROKEN_LEADING_SUFFIXES.match(compact_whitespace(text))
+        or contains_raw_output_pattern(text)
+    )
+
+
+def _list_contract_reasons(items: Any, field_name: str) -> list[str]:
+    reasons: list[str] = []
+    if not isinstance(items, list):
+        return [f"{field_name}_not_list"]
+    cleaned = [compact_whitespace(item) for item in items if isinstance(item, str) and compact_whitespace(item)]
+    if len(cleaned) < 3:
+        reasons.append(f"{field_name}_too_short")
+    normalized = [item.lower() for item in cleaned]
+    if len(set(normalized)) != len(normalized):
+        reasons.append(f"{field_name}_duplicates")
+    for item in cleaned:
+        if _contains_raw_visible_artifact(item):
+            reasons.append(f"{field_name}_raw_artifact")
+            break
+    if field_name == "recommended_actions" and cleaned:
+        generic_count = sum(any(generic in item.lower() for generic in _GENERIC_CONTRACT_ACTIONS) for item in cleaned)
+        if generic_count == len(cleaned):
+            reasons.append("recommended_actions_generic_only")
+        elif generic_count:
+            reasons.append("recommended_actions_generic")
+    return reasons
+
+
+def validate_generated_module_contract(module: dict[str, Any]) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    direct_answer = module.get("direct_answer")
+    if not isinstance(direct_answer, str) or not compact_whitespace(direct_answer):
+        reasons.append("direct_answer_missing")
+    elif _contains_raw_visible_artifact(direct_answer):
+        reasons.append("direct_answer_raw_artifact")
+
+    for field, value in module.items():
+        if isinstance(value, str) and _contains_raw_visible_artifact(value):
+            reasons.append(f"{field}_raw_artifact")
+
+    reasons.extend(_list_contract_reasons(module.get("key_findings"), "key_findings"))
+    reasons.extend(_list_contract_reasons(module.get("recommended_actions"), "recommended_actions"))
+    return (len(reasons) == 0, sorted(set(reasons)))
+
+
+def assert_no_raw_citation_ids(module: dict[str, Any]) -> tuple[bool, list[str]]:
+    reasons = []
+    for text in _module_visible_strings(module):
+        if _UUID_LIKE_PATTERN.search(text) or _RAW_BRACKETED_SOURCE_PATTERN.search(text) or _RAW_INTERNAL_ID_PATTERN.search(text):
+            reasons.append("raw_citation_id")
+            break
+    return (len(reasons) == 0, reasons)
+
+
+def assert_no_raw_visible_artifacts(module: dict[str, Any]) -> tuple[bool, list[str]]:
+    reasons = []
+    for text in _module_visible_strings(module):
+        if _contains_raw_visible_artifact(text):
+            reasons.append("raw_visible_artifact")
+            break
+    return (len(reasons) == 0, reasons)
 
 
 def build_category_fallback(normalized_key: str, module_result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1025,28 +1187,43 @@ def finalize_insight_module(module_key: str, module_result: dict[str, Any]) -> d
     if module_is_usable(cleaned):
         final_module = cleaned
         direct_answer_preserved = True
-    elif direct_answer_usable:
-        final_module = {
-            **cleaned,
-            "status": "fallback",
-            "summary": cleaned["direct_answer"],
-            "key_findings": fallback["key_findings"],
-            "recommended_actions": fallback["recommended_actions"],
-            "confidence": "Low",
-            "evidence_note": FALLBACK_EVIDENCE_NOTE,
-            "module_llm_status": "fallback_polished",
-            "fallback_reason": "module_not_usable",
-        }
-        direct_answer_preserved = True
-        findings_replaced = True
-        actions_replaced = True
-        reason = "findings_or_actions_not_usable"
     else:
+        if not direct_answer_usable and not findings_usable and not actions_usable:
+            final_module = fallback
+            findings_replaced = True
+            actions_replaced = True
+            whole_module_replaced = True
+            reason = "module_not_usable"
+        else:
+            final_module = {
+                **cleaned,
+                "status": "fallback",
+                "confidence": "Low",
+                "evidence_note": FALLBACK_EVIDENCE_NOTE,
+                "module_llm_status": "fallback_polished",
+                "fallback_reason": "module_not_usable",
+            }
+            direct_answer_preserved = direct_answer_usable
+            if not direct_answer_usable:
+                final_module["direct_answer"] = fallback["direct_answer"]
+                final_module["summary"] = fallback["direct_answer"]
+            if not findings_usable:
+                final_module["key_findings"] = fallback["key_findings"]
+                findings_replaced = True
+            if not actions_usable:
+                final_module["recommended_actions"] = fallback["recommended_actions"]
+                actions_replaced = True
+            reason = "partial_module_not_usable"
+
+    artifact_ok, artifact_reasons = assert_no_raw_visible_artifacts(final_module)
+    citation_ok, citation_reasons = assert_no_raw_citation_ids(final_module)
+    if not artifact_ok or not citation_ok:
         final_module = fallback
+        direct_answer_preserved = False
         findings_replaced = True
         actions_replaced = True
         whole_module_replaced = True
-        reason = "module_not_usable"
+        reason = ",".join(artifact_reasons + citation_reasons) or "raw_visible_artifact"
 
     log_json(
         level="INFO",
@@ -1079,17 +1256,13 @@ def build_context_snippets(
     max_chunk_chars: int = ASK_MAX_CHUNK_CHARS,
     max_total_chars: int = ASK_MAX_CONTEXT_CHARS,
 ) -> tuple[list[str], int]:
+    source_packets, _ = build_clean_source_packets(matches, max_sources=min(len(matches), 3))
     snippets: list[str] = []
     total_chars = 0
 
-    for m in matches:
-        md = m["metadata"]
-        tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
-        trimmed_text = trim_snippet_text((m.get("text") or "").strip(), max_chunk_chars)
-        if not trimmed_text:
-            continue
-
-        snippet = f"{tag}\n{trimmed_text}"
+    for packet in source_packets:
+        excerpt = trim_snippet_text(packet["excerpt"], max_chunk_chars)
+        snippet = f"{packet['label']}\n{excerpt}"
         snippet_len = len(snippet)
         if snippets and total_chars + snippet_len > max_total_chars:
             break
@@ -1194,20 +1367,22 @@ def build_insight_module_prompt(
     context_block: str,
 ) -> str:
     return (
-        "You are a senior business analyst writing for an executive audience.\n"
-        "Use the provided document excerpts as primary evidence.\n"
-        "When citing evidence, use citation tags like [doc_id:chunk_id].\n"
+        "You are generating an executive business brief from the numbered source excerpts below.\n"
+        "Use only the provided source excerpts. Cite claims using only [1], [2], or [3].\n"
+        "Never output internal IDs, UUIDs, chunk IDs, document IDs, or source IDs.\n"
+        "Never copy raw table fragments directly into prose; convert messy table evidence into readable executive sentences.\n"
         "If evidence is limited or indirect, still provide a best-effort executive analysis.\n"
         "Infer plausible items from context and label them with 'Confidence: Low' or 'Inferred'.\n"
-        "NEVER say 'the document does not mention' or 'no information available'.\n\n"
+        "NEVER say 'the document does not mention' or 'no information available'.\n"
+        "Return valid JSON only.\n\n"
         f"Insight module: {module_title}\n"
         f"Analysis focus: {retrieval_query}\n\n"
-        f"Document excerpts:\n{context_block}\n\n"
+        f"Numbered source excerpts:\n{context_block}\n\n"
         "Return ONLY valid JSON with keys:\n"
-        "- summary: concise executive summary with citations\n"
-        "- direct_answer: direct executive answer to this module with citations\n"
-        "- key_findings: 2-4 specific findings, each with citations where available\n"
-        "- recommended_actions: 2-4 specific actions tied to findings"
+        "- summary: concise executive summary with [1], [2], or [3] citations\n"
+        "- direct_answer: direct executive answer to this module with [1], [2], or [3] citations\n"
+        "- key_findings: 3-4 specific findings as complete sentences with [1], [2], or [3] citations\n"
+        "- recommended_actions: 3-4 specific, operationally useful actions tied to findings"
     )
 
 def generate_insight_module(
@@ -1944,59 +2119,97 @@ def generate_insights(req: InsightsRequest, request: Request):
                 time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
             continue
 
-        snippets, context_chars = build_context_snippets(
-            matches,
-            max_chunk_chars=INSIGHT_MAX_CHUNK_CHARS,
-            max_total_chars=INSIGHT_MAX_CONTEXT_CHARS,
-        )
-        context_block = "\n\n---\n\n".join(snippets)
+        source_packets, context_block = build_clean_source_packets(matches, max_sources=effective_top_k)
+        context_block = trim_snippet_text(context_block, INSIGHT_MAX_CONTEXT_CHARS)
+        context_chars = len(context_block)
 
         module_instruction = (
-            "You are a senior business diagnostics analyst writing for an executive audience.\n"
+            "You are generating an executive business brief from the numbered source excerpts below.\n"
             "Return ONLY valid JSON with keys: summary, direct_answer, key_findings, recommended_actions.\n"
             "Rules:\n"
-            "- summary: one concise diagnosis sentence grounded in evidence with citations [doc_id:chunk_id]\n"
-            "- direct_answer: direct executive-level answer for this module with citations [doc_id:chunk_id]\n"
-            "- key_findings: 2-4 specific findings as COMPLETE, READABLE sentences with citations\n"
-            "- recommended_actions: 2-4 concrete, non-generic business actions tied to findings\n"
+            "- Use only the provided source excerpts.\n"
+            "- Cite claims using only [1], [2], or [3]. Do not use any other citation format.\n"
+            "- Never output internal IDs, UUIDs, chunk IDs, document IDs, source IDs, or vector IDs.\n"
+            "- Never copy raw table fragments directly into prose.\n"
+            "- Convert messy table evidence into readable executive sentences.\n"
+            "- summary: one concise diagnosis sentence grounded in evidence with [1], [2], or [3] citations.\n"
+            "- direct_answer: direct executive-level answer for this module with [1], [2], or [3] citations.\n"
+            "- key_findings: 3-4 specific findings as COMPLETE, READABLE sentences with business meaning and citations.\n"
+            "- recommended_actions: 3-4 concrete, non-generic, module-specific business actions tied to findings.\n"
             "- If evidence is limited or indirect, still provide a best-effort executive analysis.\n"
             "  Infer plausible items from context and label them with 'Confidence: Low'.\n"
             "- NEVER say 'the document does not mention' or 'no information available'.\n"
             "- NEVER copy raw text fragments. Always rewrite source text as clean executive prose.\n"
             "- NEVER include broken sentences, unexplained abbreviations, or repeated words like 'Medium Medium'.\n"
+            "- Do not begin any sentence with chopped words such as ductivity, tional, ant forecast, d dock, holds Financial, ment forecast, or cy.\n"
             "- Each finding must be a complete, grammatically correct sentence that an executive can read."
         )
         module_prompt = (
             f"Module: {module_title}\n"
             f"Diagnostic goal: {retrieval_query}\n\n"
-            f"Document excerpts:\n{context_block}\n\n"
+            f"Numbered source excerpts:\n{context_block}\n\n"
             "Generate the JSON response now."
         )
         full_prompt = f"{module_instruction}\n\n{module_prompt}"
+        repair_prompt = (
+            f"{full_prompt}\n\n"
+            "The previous response violated the output contract. Rewrite the module. "
+            "Do not copy raw table fragments. Do not output UUIDs, chunk IDs, document IDs, source IDs, or internal IDs. "
+            "Use only [1], [2], [3] citations. Produce complete executive sentences. "
+            "Return ONLY valid JSON with summary, direct_answer, key_findings, and recommended_actions."
+        )
 
         try:
-            resp = generate_content_with_retry(
-                gemini=gemini,
-                model_name=model_name,
-                full_prompt=full_prompt,
-                request_id=request_id,
-                tenant_id=tenant_id,
-                retrieved_k=len(matches),
-                max_attempts=INSIGHT_MAX_GENERATION_ATTEMPTS,
-                base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
-            )
-            raw_text = getattr(resp, "text", None)
-            if raw_text is None and isinstance(resp, dict):
-                raw_text = resp.get("text")
-            raw_text = raw_text or ""
-
-            parsed_obj = parse_model_json(raw_text)
             parsed_brief = None
-            if parsed_obj is not None:
-                try:
-                    parsed_brief = InsightModuleBrief.model_validate(parsed_obj)
-                except Exception:
-                    parsed_brief = None
+            contract_reasons: list[str] = []
+            for contract_attempt, prompt in enumerate((full_prompt, repair_prompt), start=1):
+                resp = generate_content_with_retry(
+                    gemini=gemini,
+                    model_name=model_name,
+                    full_prompt=prompt,
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    retrieved_k=len(matches),
+                    max_attempts=INSIGHT_MAX_GENERATION_ATTEMPTS,
+                    base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
+                )
+                raw_text = getattr(resp, "text", None)
+                if raw_text is None and isinstance(resp, dict):
+                    raw_text = resp.get("text")
+                raw_text = raw_text or ""
+
+                parsed_obj = parse_model_json(raw_text)
+                if parsed_obj is not None:
+                    try:
+                        candidate_brief = InsightModuleBrief.model_validate(parsed_obj)
+                        candidate_module = {
+                            "summary": candidate_brief.summary,
+                            "direct_answer": candidate_brief.direct_answer,
+                            "key_findings": candidate_brief.key_findings,
+                            "recommended_actions": candidate_brief.recommended_actions,
+                        }
+                        contract_ok, contract_reasons = validate_generated_module_contract(candidate_module)
+                        if contract_ok:
+                            parsed_brief = candidate_brief
+                            break
+                    except Exception:
+                        contract_reasons = ["json_schema_invalid"]
+                else:
+                    contract_reasons = ["json_parse_failed"]
+
+                log_json(
+                    level="INFO",
+                    event="insight_module_contract_failed",
+                    service="api",
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    doc_id=doc_id,
+                    doc_id_filter=doc_id,
+                    module_key=module_id,
+                    normalized_module_key=normalize_module_key(module_id, module_title),
+                    attempt=contract_attempt,
+                    reasons=contract_reasons,
+                )
 
             if parsed_brief is not None:
                 module_status = "ok"
@@ -2011,7 +2224,7 @@ def generate_insights(req: InsightsRequest, request: Request):
             else:
                 module_status = "fallback"
                 llm_status_log = "fallback_polished"
-                fallback_reason = "json_parse_failed"
+                fallback_reason = "contract_failed"
                 module_payload = {
                     "summary": fallback_module["summary"],
                     "direct_answer": fallback_module["direct_answer"],
@@ -2123,7 +2336,24 @@ def generate_insights(req: InsightsRequest, request: Request):
         m["_finalize_tenant_id"] = tenant_id
         m["_finalize_doc_id_filter"] = doc_id
         finalized = finalize_insight_module(m.get("module_id", ""), m)
-        finalized_modules.append(normalize_module_visible_text(finalized))
+        normalized = normalize_module_visible_text(finalized)
+        artifact_ok, artifact_reasons = assert_no_raw_visible_artifacts(normalized)
+        citation_ok, citation_reasons = assert_no_raw_citation_ids(normalized)
+        if not artifact_ok or not citation_ok:
+            normalized_key = normalize_module_key(m.get("module_id", ""), m.get("title", ""))
+            normalized = build_category_fallback(normalized_key, normalized)
+            log_json(
+                level="INFO",
+                event="insight_module_final_artifact_fallback",
+                service="api",
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id_filter=doc_id,
+                module_key=m.get("module_id", ""),
+                normalized_module_key=normalized_key,
+                reasons=artifact_reasons + citation_reasons,
+            )
+        finalized_modules.append(normalized)
 
     client_modules = [_insight_module_for_response(m) for m in finalized_modules]
 
@@ -2167,15 +2397,18 @@ def ask(req: AskRequest, request: Request):
             "matches": [],
         }
 
-    # 2) Build bounded grounded context with explicit citations
-    snippets, context_chars = build_context_snippets(matches)
+    # 2) Build bounded grounded context with numbered source labels only.
+    source_packets, context_block = build_clean_source_packets(matches, max_sources=effective_top_k)
+    context_block = trim_snippet_text(context_block, ASK_MAX_CONTEXT_CHARS)
+    context_chars = len(context_block)
     citations = [m["citation"] for m in matches]
-    context_block = "\n\n---\n\n".join(snippets)
 
     system_instruction = (
         "You are Apalym, an executive business advisor for SMB operators.\n"
-        "Use the uploaded document excerpts as your grounding context.\n"
-        "When the document directly supports a claim, cite it with [doc_id:chunk_id].\n\n"
+        "Use the numbered source excerpts as your grounding context.\n"
+        "When the document directly supports a claim, cite it using only [1], [2], or [3].\n"
+        "Never output internal IDs, UUIDs, chunk IDs, document IDs, source IDs, or vector IDs.\n"
+        "Never copy raw table fragments directly into prose; convert table evidence into readable executive sentences.\n\n"
         "If the user asks for implementation guidance, next steps, strategy, prioritization,\n"
         "or 'how do I do this', you MAY provide reasonable business recommendations that go\n"
         "beyond the literal document text. Clearly separate source-backed facts (with citations)\n"
@@ -2189,7 +2422,7 @@ def ask(req: AskRequest, request: Request):
 
     user_prompt = (
         f"Question: {query_text}\n\n"
-        f"Document excerpts:\n{context_block}\n\n"
+        f"Numbered source excerpts:\n{context_block}\n\n"
         "Provide a helpful executive answer. For 'how' questions, give a practical plan.\n"
         "Cite document evidence where available. Add advisor recommendations beyond the doc if useful."
     )
@@ -2197,9 +2430,9 @@ def ask(req: AskRequest, request: Request):
     brief_instruction = (
         "Return ONLY valid JSON with keys: direct_answer, key_findings, recommended_next_actions, confidence, evidence_note.\n"
         "Rules:\n"
-        "- direct_answer: one concise, helpful executive answer. Cite with [doc_id:chunk_id] where applicable.\n"
+        "- direct_answer: one concise, helpful executive answer. Cite with [1], [2], or [3] where applicable.\n"
         "  NEVER start with 'I cannot find' or 'The document does not provide'.\n"
-        "- key_findings: 2-4 bullet points. Source-backed observations should include citations.\n"
+        "- key_findings: 2-4 bullet points. Source-backed observations should include only [1], [2], or [3] citations.\n"
         "  Advisory points that go beyond the document are welcome and should be clearly phrased as recommendations.\n"
         "- recommended_next_actions: 2-4 specific, practical, implementation-ready steps.\n"
         "  These should directly answer the user's question. If they asked 'how do I do this', answer with concrete steps.\n"
@@ -2245,7 +2478,7 @@ def ask(req: AskRequest, request: Request):
             answer_mode="extractive",
         )
         extractive_findings: list[str] = []
-        for m in matches[:4]:
+        for source_index, m in enumerate(matches[:3], start=1):
             raw = (m.get("text") or "").strip()
             if not raw:
                 continue
@@ -2254,9 +2487,7 @@ def ask(req: AskRequest, request: Request):
                 continue
             txt = trim_snippet_text(cleaned, 220)
             if txt and not contains_raw_output_pattern(txt):
-                md = m.get("metadata") or {}
-                tag = f"[{md.get('doc_id')}:{md.get('chunk_id')}]"
-                extractive_findings.append(f"{txt} {tag}")
+                extractive_findings.append(f"{txt} [{source_index}]")
 
         if not extractive_findings:
             extractive_findings = [
