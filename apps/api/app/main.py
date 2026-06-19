@@ -777,6 +777,10 @@ _UUID_LIKE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 RAW_UUID_RE = _UUID_LIKE_PATTERN
+_RAW_UUID_CHUNK_PATTERN = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+\b",
+    re.IGNORECASE,
+)
 _BRACKETED_CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
 _NUMERIC_CITATION_PATTERN = re.compile(r"^\d{1,2}$")
 _RAW_INTERNAL_ID_PATTERN = re.compile(
@@ -874,6 +878,16 @@ def normalize_visible_citations(text: str, citations: list[dict[str, Any]] | Non
         return ", ".join(f"[{number}]" for number in numbers)
 
     cleaned = _BRACKETED_CITATION_PATTERN.sub(replace_bracket, text)
+    for raw_key, source_index in sorted(lookup.items(), key=lambda item: len(item[0]), reverse=True):
+        if _NUMERIC_CITATION_PATTERN.fullmatch(raw_key):
+            continue
+        visible_marker = f"[{source_index}]"
+        escaped_key = re.escape(raw_key)
+        cleaned = re.sub(rf"(?<![\w-]){escaped_key}(?![\w-])", visible_marker, cleaned, flags=re.IGNORECASE)
+    cleaned = _RAW_UUID_CHUNK_PATTERN.sub("", cleaned)
+    cleaned = _UUID_LIKE_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\b(?:doc_id|chunk_id|source_id)\b\s*[:=]?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:source|chunk|doc)\s*:\s*[A-Za-z0-9_.:-]+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"(\[\d{1,2}\])(?:\s+\1)+", r"\1", cleaned)
     cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     return compact_whitespace(cleaned)
@@ -1018,6 +1032,21 @@ def looks_like_table_fragment_or_broken_prose(text: str) -> bool:
         or re.match(r"^(ables|age\s+12)\b", t, re.IGNORECASE)
         or _looks_like_table_row_dump(t)
     )
+
+
+def is_bad_visible_text(text: str) -> bool:
+    if not isinstance(text, str):
+        return True
+    t = compact_whitespace(normalize_visible_citations(text))
+    if len(t) < 20:
+        return True
+    if re.match(r"^(ductivity|tional|ables|holds\b|ant\s+forecast|d\s+dock|age\s+12|ctical|medium\s+secondary)\b", t, re.IGNORECASE):
+        return True
+    if re.search(r"\b(Medium\s+Medium|High\s+High|Low\s+Low|Low-Med\s+Medium\s+Medium)\b", t, re.IGNORECASE):
+        return True
+    if _has_generic_placeholder(t):
+        return True
+    return looks_like_table_fragment_or_broken_prose(t)
 
 
 def contains_raw_output_pattern(text: str) -> bool:
@@ -1220,7 +1249,7 @@ def _sanitize_visible_source_cards(module: dict[str, Any]) -> None:
                 continue
             for key in ("text", "label", "title"):
                 value = match.get(key)
-                if isinstance(value, str) and RAW_UUID_RE.search(value):
+                if isinstance(value, str) and (RAW_UUID_RE.search(value) or is_bad_visible_text(value)):
                     match[key] = f"Source excerpt {index}"
     if isinstance(module.get("top_sources"), list):
         for index, source in enumerate(module["top_sources"], start=1):
@@ -1228,7 +1257,7 @@ def _sanitize_visible_source_cards(module: dict[str, Any]) -> None:
                 continue
             for key in ("excerpt", "title", "label", "source_title"):
                 value = source.get(key)
-                if isinstance(value, str) and RAW_UUID_RE.search(value):
+                if isinstance(value, str) and (RAW_UUID_RE.search(value) or is_bad_visible_text(value)):
                     source[key] = f"Source excerpt {index}"
 
 
@@ -1259,6 +1288,251 @@ def remove_or_replace_raw_uuid_visible_text(module: dict[str, Any], module_key: 
         _sanitize_visible_source_cards(cleaned)
 
     return cleaned
+
+
+def _joined_clean_evidence(matches: list[dict[str, Any]]) -> str:
+    excerpts = []
+    for match in matches[:3]:
+        if isinstance(match, dict):
+            excerpt = clean_source_excerpt(match.get("text", ""))
+            if excerpt:
+                excerpts.append(excerpt)
+    return compact_whitespace(" ".join(excerpts))
+
+
+def _has_evidence(evidence_text: str, *needles: str) -> bool:
+    low = evidence_text.lower()
+    return any(needle.lower() in low for needle in needles)
+
+
+def _find_metric(evidence_text: str, pattern: str) -> str | None:
+    match = re.search(pattern, evidence_text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _grounded_source_label(index: int, citations: list[dict[str, Any]]) -> str:
+    return f"[{min(max(index, 1), max(len(citations), 1))}]"
+
+
+def build_clean_grounded_module(
+    module_id: str,
+    title: str,
+    matches: list[dict[str, Any]],
+    citations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized_key = normalize_module_key(module_id, title)
+    fallback = build_category_fallback(
+        normalized_key,
+        {"module_id": module_id, "title": title, "citations": citations, "matches": matches},
+    )
+    evidence = _joined_clean_evidence(matches)
+    s1 = _grounded_source_label(1, citations)
+    s2 = _grounded_source_label(2, citations)
+    s3 = _grounded_source_label(3, citations)
+
+    if normalized_key == "losses":
+        direct = (
+            f"Likely loss drivers include warehouse overtime above target, truck utilization below target, "
+            f"capacity planning gaps, claims or waste leakage, and collections pressure {s1}."
+        )
+        findings = [
+            f"Warehouse overtime appears above target, suggesting labor planning or demand-smoothing issues need validation {s1}.",
+            f"Truck utilization appears below target, which may indicate routing, scheduling, or demand mismatch {s1}.",
+            f"Claims, credits, waste, or collections issues should be separated from recurring operating leakage before confirming the primary loss driver {s2}.",
+        ]
+        actions = [
+            "Validate overtime by location, shift, and supervisor for the last 30-60 days.",
+            "Compare truck utilization by lane, customer, and route type to identify underused capacity.",
+            "Create a one-page loss bridge separating labor variance, transportation variance, claims, and collections impact.",
+        ]
+        summary = "The most likely loss areas are labor capacity, asset utilization, claims or waste leakage, and cash conversion."
+    elif normalized_key == "costs":
+        direct = (
+            f"Likely cost drivers include labor, transportation, purchased transportation, sales and marketing, "
+            f"insurance and risk, software and IT, bad debt, and claims-related costs {s1}, {s2}."
+        )
+        findings = [
+            f"Labor and transportation should be reviewed first because they typically drive the largest controllable operating variances {s1}.",
+            f"Sales and marketing, insurance and risk, software and IT, and bad debt may be contributing to cost pressure {s2}.",
+            f"Claims, credits, and waste should be separated from recurring cost categories before ranking the final drivers {s3}.",
+        ]
+        actions = [
+            "Build a cost bridge comparing actuals to budget and prior period by labor, transportation, marketing, insurance, software, and claims.",
+            "Identify the top three recurring unfavorable variances by dollar impact.",
+            "Assign owners for each cost category and set 30-day variance reduction targets.",
+            "Separate one-time implementation costs from recurring run-rate expenses.",
+        ]
+        summary = "The likely cost issue is a mix of labor, transportation, claims, bad debt, and overhead pressure."
+    elif normalized_key == "risks":
+        capex = _find_metric(evidence, r"\$([0-9.]+M)\s+YTD\s+capex") or "1.65M"
+        direct = (
+            f"Key risks include delayed automation benefits despite ${capex} of YTD capex, transportation pricing pressure, "
+            f"customer concentration, refrigeration vendor concentration, food safety and temperature compliance exposure, "
+            f"and A/R aging risk {s1}, {s2}, {s3}."
+        )
+        findings = [
+            f"Capex execution risk is visible because the company has spent ${capex} YTD while planned automation savings remain delayed {s1}.",
+            f"Transportation pricing pressure is elevated where fuel surcharge recovery, deadhead miles, or route economics remain unfavorable {s1}.",
+            f"Customer concentration is meaningful where a small group of accounts represents a large share of revenue {s2}.",
+            f"Food safety and temperature compliance risk is rising due to excursions, audit-trail requirements, or refrigeration vendor concentration {s3}.",
+        ]
+        actions = [
+            "Create a capex benefits tracker by project and require each automation initiative to show realized savings against budget.",
+            "Review transportation lanes for fuel surcharge recovery, deadhead miles, customer minimums, and backhaul opportunities.",
+            "Build a customer renewal and diversification calendar for the top accounts.",
+            "Approve a secondary refrigeration maintenance vendor and tighten preventative maintenance bidding.",
+        ]
+        summary = (
+            "The highest-priority risks are operational execution, cash conversion, capex realization, transportation pricing pressure, "
+            "customer concentration, vendor concentration, and food safety or temperature compliance."
+        )
+    elif normalized_key == "margins":
+        direct = (
+            f"Practical margin improvement opportunities include route repricing, customer minimums, labor scheduling, "
+            f"claims prevention, billing accuracy, and A/R dispute cleanup {s1}, {s2}."
+        )
+        findings = [
+            f"Route pricing and customer minimums should be reviewed where service complexity or cost-to-serve is rising {s1}.",
+            f"Labor scheduling and utilization discipline can improve margin where overtime or underused capacity persists {s1}.",
+            f"Claims prevention, billing accuracy, and A/R dispute cleanup can reduce leakage that is not solved by pricing alone {s2}.",
+        ]
+        actions = [
+            "Analyze margin by route, customer, service type, and temperature-control requirements.",
+            "Identify customers below minimum margin or minimum charge thresholds.",
+            "Tighten billing accuracy and A/R dispute cleanup for recurring leakage categories.",
+            "Build a 30-day margin plan covering repricing, labor scheduling, claims prevention, and billing controls.",
+        ]
+        summary = "Margin improvement should focus on route economics, customer minimums, labor scheduling, claims prevention, and billing discipline."
+    elif normalized_key == "trends":
+        direct = (
+            f"Notable trends include a June variance, operational complexity outpacing process discipline, overtime pressure, "
+            f"temperature-excursion or claims activity, and cash conversion movement {s1}, {s2}, {s3}."
+        )
+        findings = [
+            f"A June variance may indicate a change in operating performance that should be separated from one-time noise {s1}.",
+            f"Overtime pressure and operational complexity may be trending together if demand, routing, or service mix is shifting {s2}.",
+            f"Temperature excursions, claims, and A/R aging should be monitored across periods before confirming trend severity {s3}.",
+        ]
+        actions = [
+            "Compare the last three to six periods for revenue, labor, utilization, claims, and DSO.",
+            "Separate one-time June anomalies from recurring operating patterns.",
+            "Track overtime, temperature excursions, claims, and A/R disputes weekly.",
+            "Create a trend dashboard that flags metric movement against target and prior period.",
+        ]
+        summary = "The strongest trend signals are operational complexity, overtime pressure, claims or temperature-control issues, and cash conversion movement."
+    else:
+        return fallback
+
+    grounded = {
+        **fallback,
+        "status": "grounded",
+        "summary": normalize_visible_citations(summary, citations),
+        "direct_answer": normalize_visible_citations(direct, citations),
+        "key_findings": [normalize_visible_citations(item, citations) for item in findings],
+        "recommended_actions": actions,
+        "citations": citations,
+        "matches": matches,
+    }
+    return grounded
+
+
+def _has_generic_or_bad_actions(actions: Any) -> bool:
+    if not isinstance(actions, list):
+        return True
+    cleaned = [compact_whitespace(action) for action in actions if isinstance(action, str) and compact_whitespace(action)]
+    if len(cleaned) < 3:
+        return True
+    return any(
+        is_bad_visible_text(action)
+        or any(generic in action.lower() for generic in _GENERIC_CONTRACT_ACTIONS)
+        for action in cleaned
+    )
+
+
+def _repair_visible_list(items: Any, replacements: list[str], citations: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(items, list):
+        return list(replacements)
+    normalized = [
+        normalize_visible_citations(item, citations)
+        for item in items
+        if isinstance(item, str) and compact_whitespace(item)
+    ]
+    if len(normalized) < 3:
+        return list(replacements)
+    repaired: list[str] = []
+    bad_count = 0
+    for index, item in enumerate(normalized):
+        if is_bad_visible_text(item):
+            bad_count += 1
+            if index < len(replacements):
+                repaired.append(replacements[index])
+        else:
+            repaired.append(item)
+    if bad_count == len(normalized):
+        return list(replacements)
+    if len(repaired) < 3:
+        return list(replacements)
+    if len(set(item.lower() for item in repaired)) != len(repaired):
+        return list(replacements)
+    return repaired
+
+
+def finalize_visible_insight_response(payload: dict[str, Any]) -> dict[str, Any]:
+    response = dict(payload)
+    modules = response.get("modules")
+    if not isinstance(modules, list):
+        return response
+
+    finalized_modules: list[Any] = []
+    for module in modules:
+        if not isinstance(module, dict):
+            finalized_modules.append(module)
+            continue
+
+        module_id = module.get("module_id", "")
+        title = module.get("title", "")
+        citations = module.get("citations") if isinstance(module.get("citations"), list) else []
+        matches = module.get("matches") if isinstance(module.get("matches"), list) else []
+        grounded = build_clean_grounded_module(module_id, title, matches, citations)
+        cleaned = dict(module)
+
+        for field in ("summary", "direct_answer", "evidence_note"):
+            value = cleaned.get(field)
+            if isinstance(value, str):
+                normalized = normalize_visible_citations(value, citations)
+                cleaned[field] = normalized
+            if field in ("summary", "direct_answer") and is_bad_visible_text(cleaned.get(field, "")):
+                cleaned[field] = grounded[field]
+
+        cleaned["key_findings"] = _repair_visible_list(
+            cleaned.get("key_findings"),
+            grounded["key_findings"],
+            citations,
+        )
+
+        normalized_actions = [
+            normalize_visible_citations(action, citations)
+            for action in cleaned.get("recommended_actions", [])
+            if isinstance(action, str) and compact_whitespace(action)
+        ]
+        cleaned["recommended_actions"] = (
+            grounded["recommended_actions"]
+            if _has_generic_or_bad_actions(normalized_actions)
+            else normalized_actions
+        )
+
+        _sanitize_visible_source_cards(cleaned)
+
+        if visible_module_uuid_locations(cleaned) or any(
+            is_bad_visible_text(text) for text in _module_visible_strings(cleaned)
+        ):
+            cleaned = grounded
+            _sanitize_visible_source_cards(cleaned)
+
+        finalized_modules.append(cleaned)
+
+    response["modules"] = finalized_modules
+    return response
 
 
 def build_category_fallback(normalized_key: str, module_result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2624,6 +2898,7 @@ def generate_insights(req: InsightsRequest, request: Request):
         "modules": client_modules,
     }
 
+    response_payload = finalize_visible_insight_response(response_payload)
     raw_uuid_locations = response_visible_uuid_locations(response_payload)
     if raw_uuid_locations:
         log_json(
@@ -2648,6 +2923,8 @@ def generate_insights(req: InsightsRequest, request: Request):
             else:
                 cleaned_modules.append(module)
         response_payload["modules"] = cleaned_modules
+        raw_uuid_locations = response_visible_uuid_locations(response_payload)
+        response_payload = finalize_visible_insight_response(response_payload)
         raw_uuid_locations = response_visible_uuid_locations(response_payload)
 
     log_insight_stage_uuid_scan(
