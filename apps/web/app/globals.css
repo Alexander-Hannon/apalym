@@ -601,13 +601,18 @@ input {
   white-space: pre-wrap;
 }
 
+.citation-pills {
+  display: inline;
+  margin-left: 4px;
+}
+
 .citation-chip {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 23px;
-  margin: 0 4px;
-  padding: 1px 6px;
+  min-width: 20px;
+  margin: 0 2px;
+  padding: 1px 5px;
   border-radius: 999px;
   border: 1px solid rgba(147, 125, 255, 0.45);
   background: rgba(113, 88, 225, 0.24);
@@ -615,6 +620,55 @@ input {
   font-size: 11px;
   font-weight: 700;
   vertical-align: text-top;
+  cursor: default;
+}
+
+.source-evidence-drawer {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 10px;
+}
+
+.evidence-label {
+  margin: 0 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.sources-subtitle {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.assumptions-note {
+  margin-top: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(17, 22, 38, 0.56);
+}
+
+.assumptions-note h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.assumptions-note ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.assumptions-note li {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 4px;
 }
 
 .ask-card {

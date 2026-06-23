@@ -69,19 +69,33 @@ type AskResp = {
   message?: string;
 };
 
-type InsightModuleStatus = "ok" | "grounded" | "fallback" | "failed" | "insufficient_evidence";
+type InsightModuleStatus = "ok" | "limited_evidence" | "grounded" | "fallback" | "failed" | "insufficient_evidence" | "error";
+
+type CitedText = {
+  text: string;
+  citation_ids: number[];
+};
+
+type StructuredCitation = {
+  id: number;
+  source_id: string;
+  excerpt_label: string;
+  excerpt: string;
+  confidence: "high" | "medium" | "low";
+};
 
 type InsightModule = {
   module_id: string;
   title: string;
   status: InsightModuleStatus;
-  summary: string;
-  direct_answer: string;
-  key_findings: string[];
-  recommended_actions: string[];
-  citations: Citation[];
-  matches: RetrievalMatch[];
-  error?: string;
+  confidence?: "high" | "medium" | "low";
+  summary: CitedText | string;
+  direct_answer: CitedText | string;
+  key_findings: (CitedText | string)[];
+  recommended_actions: (CitedText | string)[];
+  limitations?: string[];
+  assumptions?: string[];
+  citations: (StructuredCitation | Citation)[];
 };
 
 type InsightsResp = {
@@ -152,6 +166,21 @@ function stripRawUuidCitationNoise(text: string): string {
     .replace(/\[[0-9a-f]{8}-[0-9a-f-]{27}(?:\s*,\s*[0-9a-f]{8}-[0-9a-f-]{27})*\]/gi, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+function citedTextStr(val: CitedText | string | undefined): string {
+  if (!val) return "";
+  if (typeof val === "string") return val;
+  return val.text || "";
+}
+
+function citedTextIds(val: CitedText | string | undefined): number[] {
+  if (!val || typeof val === "string") return [];
+  return val.citation_ids || [];
+}
+
+function isStructuredCitation(c: StructuredCitation | Citation): c is StructuredCitation {
+  return typeof (c as StructuredCitation).id === "number" && "excerpt" in c;
 }
 
 function splitSentences(text: string) {
@@ -297,20 +326,20 @@ function buildCitationOrder(citations: Citation[]): Map<string, number> {
 
 function statusHintForInsight(status: InsightModuleStatus): string {
   if (status === "ok") return "";
-  if (status === "insufficient_evidence") {
-    return "Limited evidence — this diagnosis is based on limited source evidence and should be validated with supporting data.";
+  if (status === "limited_evidence" || status === "insufficient_evidence") {
+    return "This diagnosis is based on limited source evidence and should be validated with supporting data.";
   }
   if (status === "grounded" || status === "fallback") {
-    return "Needs validation — this diagnosis is based on limited source evidence and should be validated with supporting data.";
+    return "This diagnosis is based on limited source evidence and should be validated with supporting data.";
   }
   return "This module could not be fully assembled for this run. Try regenerating or ask a follow-up question.";
 }
 
 function statusBadgeLabel(status: InsightModuleStatus): string | null {
   if (status === "ok") return null;
-  if (status === "insufficient_evidence") return "Limited evidence";
+  if (status === "limited_evidence" || status === "insufficient_evidence") return "Limited evidence";
   if (status === "grounded" || status === "fallback") return "Needs validation";
-  if (status === "failed") return "Unavailable";
+  if (status === "failed" || status === "error") return "Unavailable";
   return null;
 }
 
@@ -463,10 +492,8 @@ export default function Home() {
   const selectedInsight = insightsById.get(selectedInsightId);
   const selectedTab = INSIGHT_TABS.find((tab) => tab.moduleId === selectedInsightId) ?? INSIGHT_TABS[0];
 
-  const selectedMatchesBySource = useMemo(() => {
-    const lookup = new Map<string, RetrievalMatch>();
-    (selectedInsight?.matches ?? []).forEach((match) => lookup.set(match.id, match));
-    return lookup;
+  const selectedStructuredCitations = useMemo(() => {
+    return (selectedInsight?.citations ?? []).filter(isStructuredCitation) as StructuredCitation[];
   }, [selectedInsight]);
 
   const citationOrder = useMemo(() => buildCitationOrder(citations), [citations]);
@@ -870,7 +897,16 @@ export default function Home() {
                     )}
                   </div>
                   <h2>{selectedInsight.title}</h2>
-                  <p>{selectedInsight.direct_answer}</p>
+                  <p>
+                    {citedTextStr(selectedInsight.direct_answer) || citedTextStr(selectedInsight.summary)}
+                    {citedTextIds(selectedInsight.direct_answer).length > 0 && (
+                      <span className="citation-pills">
+                        {citedTextIds(selectedInsight.direct_answer).map((id) => (
+                          <span key={id} className="citation-chip" title={`Source excerpt ${id}`}>{id}</span>
+                        ))}
+                      </span>
+                    )}
+                  </p>
                   {statusHintForInsight(selectedInsight.status) && (
                     <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
                   )}
@@ -885,62 +921,75 @@ export default function Home() {
               <div className="details-grid">
                 <section className="detail-panel findings-panel">
                   <h3>Key Findings</h3>
-                  {selectedInsight.key_findings.length === 0 ? (
-                    <p className="sources-empty">No findings returned for this module.</p>
-                  ) : (
-                    <ul>
-                      {selectedInsight.key_findings.map((finding, index) => (
-                        <li key={index}>{finding}</li>
-                      ))}
-                    </ul>
-                  )}
+                  <ul>
+                    {selectedInsight.key_findings.map((finding, index) => (
+                      <li key={index}>
+                        {citedTextStr(finding)}
+                        {citedTextIds(finding).length > 0 && (
+                          <span className="citation-pills">
+                            {citedTextIds(finding).map((id) => (
+                              <span key={id} className="citation-chip" title={`Source excerpt ${id}`}>{id}</span>
+                            ))}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
                 </section>
 
                 <section className="detail-panel actions-panel">
                   <h3>Recommended Actions</h3>
-                  {selectedInsight.recommended_actions.length === 0 ? (
-                    <p className="sources-empty">No actions returned for this module.</p>
-                  ) : (
-                    <ul>
-                      {selectedInsight.recommended_actions.map((action, index) => (
-                        <li key={index}>{action}</li>
-                      ))}
-                    </ul>
-                  )}
+                  <ul>
+                    {selectedInsight.recommended_actions.map((action, index) => (
+                      <li key={index}>{citedTextStr(action)}</li>
+                    ))}
+                  </ul>
                 </section>
 
                 <section className="detail-panel sources-panel">
                   <div className="sources-head">
                     <h3>Top Sources</h3>
+                    <p className="sources-subtitle">View the source evidence used for this diagnosis.</p>
                     {indexed && (
                       <button type="button" className="ghost-btn" disabled={!canRegenerateInsights} onClick={() => fetchInsights(indexed.doc_id)}>
                         Regenerate
                       </button>
                     )}
                   </div>
-                  {selectedInsight.citations.length === 0 ? (
+                  {selectedStructuredCitations.length === 0 ? (
                     <p className="sources-empty">No source excerpts were available for this insight.</p>
                   ) : (
                     <div className="sources-list">
-                      {selectedInsight.citations.map((citation, index) => {
-                        const match = selectedMatchesBySource.get(citation.source_id);
-                        return (
-                          <details key={`${selectedInsight.module_id}-${citation.source_id}`} className="source-row">
-                            <summary>
-                              <span className="source-number">{index + 1}</span>
-                              <div>
-                                <p className="source-title">Source excerpt {index + 1}</p>
-                                <p className="source-confidence">{confidenceLabel(citation.score)}</p>
-                              </div>
-                            </summary>
-                            {match?.text && <p className="source-preview">{match.text}</p>}
-                          </details>
-                        );
-                      })}
+                      {selectedStructuredCitations.map((sc) => (
+                        <details key={`${selectedInsight.module_id}-src-${sc.id}`} className="source-row">
+                          <summary>
+                            <span className="source-number">{sc.id}</span>
+                            <div>
+                              <p className="source-title">{sc.excerpt_label}</p>
+                              <p className="source-confidence">{sc.confidence === "high" ? "High confidence" : sc.confidence === "medium" ? "Medium confidence" : "Low confidence"}</p>
+                            </div>
+                          </summary>
+                          {sc.excerpt && (
+                            <div className="source-evidence-drawer">
+                              <p className="evidence-label">Source evidence — not AI-generated analysis</p>
+                              <p className="source-preview">{sc.excerpt}</p>
+                            </div>
+                          )}
+                        </details>
+                      ))}
                     </div>
                   )}
                 </section>
               </div>
+
+              {selectedInsight.assumptions && selectedInsight.assumptions.length > 0 && (
+                <div className="assumptions-note">
+                  <h4>Assumptions</h4>
+                  <ul>
+                    {selectedInsight.assumptions.map((a, i) => <li key={i}>{a}</li>)}
+                  </ul>
+                </div>
+              )}
             </>
           )}
         </section>
