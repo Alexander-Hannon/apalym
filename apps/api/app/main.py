@@ -1577,51 +1577,180 @@ def search(req: SearchRequest, request: Request):
     }
 
 
-def _neutral_insight_unavailable_copy() -> str:
-    return (
-        "This perspective could not be assembled from your document for this run. "
-        "Other diagnosis tabs or follow-up Q&A may still help."
-    )
+# ---------------------------------------------------------------------------
+# EXECUTIVE MODULE FINALIZER
+# The single authoritative function that produces the client-facing module
+# contract. No other code path may place raw Pinecone chunk text, source IDs,
+# or UUIDs into user-visible narrative fields.
+# ---------------------------------------------------------------------------
+
+_SOURCE_ARTIFACT_RE = re.compile(
+    r"\["
+    r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"
+    r"(?::\d+)?"
+    r"(?:\s*,\s*[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?::\d+)?)*"
+    r"\]",
+    re.IGNORECASE,
+)
+_BARE_UUID_RE = re.compile(
+    r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b",
+    re.IGNORECASE,
+)
+_BRACKET_CITATION_RE = re.compile(r"\[\d+\]")
+_INTERNAL_TAG_RE = re.compile(r"\[[^\]]*:[^\]]*\]")
 
 
-def enforce_module_quality_gate(
-    module: dict[str, Any],
+def strip_source_artifacts(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _SOURCE_ARTIFACT_RE.sub("", text)
+    cleaned = _BARE_UUID_RE.sub("", cleaned)
+    cleaned = _INTERNAL_TAG_RE.sub("", cleaned)
+    cleaned = _BRACKET_CITATION_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _build_structured_citations(
+    raw_citations: list[dict[str, Any]],
+    raw_matches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    match_text_lookup: dict[str, str] = {}
+    for m in raw_matches:
+        sid = m.get("id") or (m.get("citation") or {}).get("source_id") or ""
+        txt = (m.get("text") or "").strip()
+        if sid and txt:
+            match_text_lookup[sid] = txt
+
+    structured: list[dict[str, Any]] = []
+    for idx, cit in enumerate(raw_citations):
+        source_id = cit.get("source_id", "")
+        raw_excerpt = match_text_lookup.get(source_id, "")
+        clean_excerpt = compact_whitespace(raw_excerpt)[:500] if raw_excerpt else ""
+
+        score = cit.get("score")
+        if isinstance(score, (int, float)):
+            if score >= 0.75:
+                conf = "high"
+            elif score >= 0.55:
+                conf = "medium"
+            else:
+                conf = "low"
+        else:
+            conf = "medium"
+
+        structured.append({
+            "id": idx + 1,
+            "source_id": source_id,
+            "excerpt_label": f"Source excerpt {idx + 1}",
+            "excerpt": clean_excerpt,
+            "confidence": conf,
+        })
+    return structured
+
+
+def _resolve_citation_ids(
+    text: str,
+    source_id_to_num: dict[str, int],
+) -> list[int]:
+    found: set[int] = set()
+    for sid, num in source_id_to_num.items():
+        short_id = sid.split(":")[0] if ":" in sid else sid
+        if short_id and short_id[:8] in text:
+            found.add(num)
+    return sorted(found) if found else []
+
+
+def _make_cited_text(
+    raw_text: str,
+    source_id_to_num: dict[str, int],
+    fallback_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    clean = strip_source_artifacts(raw_text)
+    ids = _resolve_citation_ids(raw_text, source_id_to_num)
+    if not ids and fallback_ids:
+        ids = fallback_ids
+    return {"text": clean, "citation_ids": ids}
+
+
+def finalize_executive_module(
+    module_id: str,
+    title: str,
+    generated_module: dict[str, Any] | None,
+    retrieved_matches: list[dict[str, Any]],
+    raw_citations: list[dict[str, Any]],
     request_id: str,
     tenant_id: str,
     doc_id: str,
 ) -> dict[str, Any]:
-    """Final quality gate: prevents raw retrieved fragments from reaching pilot
-    users even when LLM marks output as generated. Guarantees non-empty
-    direct_answer, key_findings (>=3), and recommended_actions (>=3)."""
-    module_id = module.get("module_id", "")
-    module_title = module.get("title", "")
-    copy = get_module_fallback_copy(module_id, module_title)
+    """Single authoritative finalizer for insight modules. Produces the client-
+    facing contract. Raw Pinecone text only appears inside citations[].excerpt.
+    """
+    copy = get_module_fallback_copy(module_id, title)
+    structured_citations = _build_structured_citations(raw_citations, retrieved_matches)
+    sid_to_num = {c["source_id"]: c["id"] for c in structured_citations}
+    all_ids = [c["id"] for c in structured_citations]
+
+    status = "ok"
+    confidence = "medium" if retrieved_matches else "low"
     fields_replaced: list[str] = []
+    limitations: list[str] = []
+    assumptions: list[str] = []
 
-    da = module.get("direct_answer", "")
-    if not da or looks_like_raw_or_broken(da):
-        module["direct_answer"] = copy["direct_answer"]
+    if generated_module is None:
+        status = "limited_evidence"
+        confidence = "low"
+        fields_replaced = ["direct_answer", "key_findings", "recommended_actions"]
+        limitations = ["AI generation was not available for this module."]
+        assumptions = [
+            "The issues identified are treated as directional until validated with supporting data.",
+            "Additional detail is needed before making final operational or financial decisions.",
+        ]
+        return {
+            "module_id": module_id,
+            "title": title,
+            "status": status,
+            "confidence": confidence,
+            "summary": _make_cited_text(copy["direct_answer"], sid_to_num, all_ids[:1]),
+            "direct_answer": _make_cited_text(copy["direct_answer"], sid_to_num, all_ids[:1]),
+            "key_findings": [_make_cited_text(f, sid_to_num) for f in copy["key_findings"]],
+            "recommended_actions": [_make_cited_text(a, sid_to_num) for a in copy["recommended_actions"]],
+            "limitations": limitations,
+            "assumptions": assumptions,
+            "citations": structured_citations,
+        }
+
+    g_da = strip_source_artifacts(generated_module.get("direct_answer", ""))
+    g_summary = strip_source_artifacts(generated_module.get("summary", ""))
+    g_findings = [strip_source_artifacts(f) for f in (generated_module.get("key_findings") or [])]
+    g_actions = [strip_source_artifacts(a) for a in (generated_module.get("recommended_actions") or [])]
+
+    if not g_da or looks_like_raw_or_broken(g_da):
+        g_da = copy["direct_answer"]
         fields_replaced.append("direct_answer")
-
-    summary = module.get("summary", "")
-    if not summary or looks_like_raw_or_broken(summary):
-        module["summary"] = module["direct_answer"]
+    if not g_summary or looks_like_raw_or_broken(g_summary):
+        g_summary = g_da
         fields_replaced.append("summary")
 
-    kf = module.get("key_findings") or []
-    if len(kf) < 3 or any(looks_like_raw_or_broken(f) for f in kf):
-        module["key_findings"] = list(copy["key_findings"][:4])
+    clean_findings = [f for f in g_findings if f and not looks_like_raw_or_broken(f)]
+    if len(clean_findings) < 2:
+        clean_findings = list(copy["key_findings"])
         fields_replaced.append("key_findings")
 
-    ra = module.get("recommended_actions") or []
-    all_generic = all(looks_generic_or_low_value_action(a) for a in ra) if ra else True
-    if len(ra) < 3 or any(looks_like_raw_or_broken(a) for a in ra) or all_generic:
-        module["recommended_actions"] = list(copy["recommended_actions"][:4])
+    clean_actions = [a for a in g_actions if a and not looks_like_raw_or_broken(a)]
+    all_generic = all(looks_generic_or_low_value_action(a) for a in clean_actions) if clean_actions else True
+    if len(clean_actions) < 2 or all_generic:
+        clean_actions = list(copy["recommended_actions"])
         fields_replaced.append("recommended_actions")
 
     if fields_replaced:
-        original_status = module.get("status", "unknown")
-        module["status"] = "grounded"
+        status = "limited_evidence"
+        confidence = "low"
+        limitations.append("Some analysis fields were replaced with structured fallback due to source-quality limitations.")
+        assumptions = [
+            "The issues identified are treated as directional until validated with supporting data.",
+            "Additional detail is needed before making final operational or financial decisions.",
+        ]
 
         log_json(
             level="INFO",
@@ -1631,19 +1760,30 @@ def enforce_module_quality_gate(
             tenant_id=tenant_id,
             doc_id_filter=doc_id,
             module_id=module_id,
-            module_title=module_title,
-            original_module_llm_status=original_status,
-            new_module_llm_status="grounded",
+            module_title=title,
             fields_replaced=fields_replaced,
             fallback_reason="final_quality_gate",
-            confidence="Low",
+            confidence=confidence,
         )
 
-    return module
+    da_cited = _make_cited_text(g_da, sid_to_num, all_ids[:1])
+    summary_cited = _make_cited_text(g_summary, sid_to_num, all_ids[:1])
+    findings_cited = [_make_cited_text(f, sid_to_num) for f in clean_findings[:4]]
+    actions_cited = [_make_cited_text(a, sid_to_num) for a in clean_actions[:4]]
 
-
-def _insight_module_for_response(module: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in module.items() if key != "error"}
+    return {
+        "module_id": module_id,
+        "title": title,
+        "status": status,
+        "confidence": confidence,
+        "summary": summary_cited,
+        "direct_answer": da_cited,
+        "key_findings": findings_cited,
+        "recommended_actions": actions_cited,
+        "limitations": limitations,
+        "assumptions": assumptions,
+        "citations": structured_citations,
+    }
 
 
 @app.post("/v1/insights")
@@ -1663,14 +1803,13 @@ def generate_insights(req: InsightsRequest, request: Request):
     model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
     gemini = get_gemini_client()
 
-    module_results: list[dict[str, Any]] = []
+    client_modules: list[dict[str, Any]] = []
     success_count = 0
-    neutral_copy = _neutral_insight_unavailable_copy()
 
-    for mod_index, module in enumerate(INSIGHT_MODULE_DEFINITIONS):
-        module_id = module["module_id"]
-        module_title = module["title"]
-        retrieval_query = module["retrieval_query"]
+    for mod_index, module_def in enumerate(INSIGHT_MODULE_DEFINITIONS):
+        module_id = module_def["module_id"]
+        module_title = module_def["title"]
+        retrieval_query = module_def["retrieval_query"]
 
         try:
             matches = retrieve_matches(
@@ -1681,251 +1820,89 @@ def generate_insights(req: InsightsRequest, request: Request):
                 request_id=request_id,
             )
         except Exception as error:
-            log_json(
-                level="ERROR",
-                event="insight_module_retrieval_failed",
-                service="api",
-                request_id=request_id,
-                tenant_id=tenant_id,
-                doc_id=doc_id,
-                module_id=module_id,
-                module_title=module_title,
-                doc_id_filter=doc_id,
-                top_k=effective_top_k,
-                detail=str(error)[:500],
-            )
-            module_results.append(
-                {
-                    "module_id": module_id,
-                    "title": module_title,
-                    "status": "failed",
-                    "error": f"Retrieval failed: {str(error)[:500]}",
-                    "summary": neutral_copy,
-                    "direct_answer": neutral_copy,
-                    "key_findings": [
-                        "If this keeps happening, try a smaller file or retry once the workspace is less busy."
-                    ],
-                    "recommended_actions": [
-                        "Regenerate the diagnosis after upload completes, or ask a targeted follow-up question in Q&A.",
-                    ],
-                    "citations": [],
-                    "matches": [],
-                }
-            )
-            log_json(
-                level="INFO",
-                event="insight_module_status",
-                service="api",
-                request_id=request_id,
-                tenant_id=tenant_id,
-                doc_id=doc_id,
-                module_id=module_id,
-                module_llm_status="failed",
-                retrieved_k=0,
-                doc_id_filter=doc_id,
-                top_k=effective_top_k,
-            )
+            log_json(level="ERROR", event="insight_module_retrieval_failed", service="api",
+                     request_id=request_id, tenant_id=tenant_id, doc_id=doc_id,
+                     module_id=module_id, detail=str(error)[:500])
+            client_modules.append(finalize_executive_module(
+                module_id, module_title, None, [], [],
+                request_id, tenant_id, doc_id,
+            ))
             if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
                 time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
             continue
 
-        citations = [m["citation"] for m in matches]
-        fallback_brief = build_insight_module_fallback(module_title, matches, module_id=module_id)
+        raw_citations = [m["citation"] for m in matches]
 
         if not matches:
-            module_results.append(
-                {
-                    "module_id": module_id,
-                    "title": module_title,
-                    "status": "insufficient_evidence",
-                    "summary": fallback_brief.summary,
-                    "direct_answer": fallback_brief.direct_answer,
-                    "key_findings": fallback_brief.key_findings,
-                    "recommended_actions": fallback_brief.recommended_actions,
-                    "citations": citations,
-                    "matches": matches,
-                }
-            )
+            client_modules.append(finalize_executive_module(
+                module_id, module_title, None, matches, raw_citations,
+                request_id, tenant_id, doc_id,
+            ))
             success_count += 1
-            log_json(
-                level="INFO",
-                event="insight_module_status",
-                service="api",
-                request_id=request_id,
-                tenant_id=tenant_id,
-                doc_id=doc_id,
-                module_id=module_id,
-                module_llm_status="insufficient_evidence",
-                retrieved_k=0,
-                doc_id_filter=doc_id,
-                top_k=effective_top_k,
-            )
             if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
                 time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
             continue
 
         snippets, context_chars = build_context_snippets(
-            matches,
-            max_chunk_chars=INSIGHT_MAX_CHUNK_CHARS,
-            max_total_chars=INSIGHT_MAX_CONTEXT_CHARS,
-        )
+            matches, max_chunk_chars=INSIGHT_MAX_CHUNK_CHARS, max_total_chars=INSIGHT_MAX_CONTEXT_CHARS)
         context_block = "\n\n---\n\n".join(snippets)
 
         module_instruction = (
             "You are a senior business diagnostics analyst writing for an executive audience.\n"
             "Return ONLY valid JSON with keys: summary, direct_answer, key_findings, recommended_actions.\n"
             "Rules:\n"
-            "- summary: one concise diagnosis sentence grounded in evidence with citations [doc_id:chunk_id]\n"
-            "- direct_answer: direct executive-level answer for this module with citations [doc_id:chunk_id]\n"
-            "- key_findings: 2-4 specific findings as COMPLETE, READABLE sentences with citations\n"
-            "- recommended_actions: 2-4 concrete, non-generic business actions tied to findings\n"
-            "- If evidence is limited or indirect, still provide a best-effort executive analysis.\n"
-            "  Infer plausible items from context and label them with 'Confidence: Low'.\n"
-            "- NEVER say 'the document does not mention' or 'no information available'.\n"
-            "- NEVER copy raw text fragments. Always rewrite source text as clean executive prose.\n"
-            "- NEVER include broken sentences, unexplained abbreviations, or repeated words like 'Medium Medium'.\n"
-            "- Each finding must be a complete, grammatically correct sentence that an executive can read."
+            "- summary: one concise diagnosis sentence. Cite evidence with [doc_id:chunk_id].\n"
+            "- direct_answer: executive-level answer with citations [doc_id:chunk_id].\n"
+            "- key_findings: 2-4 COMPLETE, READABLE sentences with citations.\n"
+            "- recommended_actions: 2-4 concrete, non-generic business actions.\n"
+            "- NEVER copy raw text fragments. Rewrite as clean executive prose.\n"
+            "- NEVER include broken sentences, table dumps, or repeated labels like 'Medium Medium'.\n"
+            "- Each item must be a complete, grammatically correct sentence."
         )
-        module_prompt = (
-            f"Module: {module_title}\n"
-            f"Diagnostic goal: {retrieval_query}\n\n"
-            f"Document excerpts:\n{context_block}\n\n"
-            "Generate the JSON response now."
+        full_prompt = (
+            f"{module_instruction}\n\n"
+            f"Module: {module_title}\nDiagnostic goal: {retrieval_query}\n\n"
+            f"Document excerpts:\n{context_block}\n\nGenerate the JSON response now."
         )
-        full_prompt = f"{module_instruction}\n\n{module_prompt}"
 
+        generated_module: dict[str, Any] | None = None
         try:
             resp = generate_content_with_retry(
-                gemini=gemini,
-                model_name=model_name,
-                full_prompt=full_prompt,
-                request_id=request_id,
-                tenant_id=tenant_id,
-                retrieved_k=len(matches),
+                gemini=gemini, model_name=model_name, full_prompt=full_prompt,
+                request_id=request_id, tenant_id=tenant_id, retrieved_k=len(matches),
                 max_attempts=INSIGHT_MAX_GENERATION_ATTEMPTS,
                 base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
             )
             raw_text = getattr(resp, "text", None)
             if raw_text is None and isinstance(resp, dict):
                 raw_text = resp.get("text")
-            raw_text = raw_text or ""
 
-            parsed_obj = parse_model_json(raw_text)
-            parsed_brief = None
+            parsed_obj = parse_model_json(raw_text or "")
             if parsed_obj is not None:
-                try:
-                    parsed_brief = InsightModuleBrief.model_validate(parsed_obj)
-                except Exception:
-                    parsed_brief = None
+                generated_module = parsed_obj
 
-            final_brief = merge_insight_brief_with_fallback(parsed_brief, fallback_brief)
-            if parsed_brief is not None:
-                module_status = "ok"
-                llm_status_log = "generated"
-                fallback_reason = None
-            else:
-                module_status = "grounded"
-                llm_status_log = "fallback_polished"
-                fallback_reason = "json_parse_failed"
-
-            module_results.append(
-                {
-                    "module_id": module_id,
-                    "title": module_title,
-                    "status": module_status,
-                    "summary": final_brief.summary,
-                    "direct_answer": final_brief.direct_answer,
-                    "key_findings": final_brief.key_findings,
-                    "recommended_actions": final_brief.recommended_actions,
-                    "citations": citations,
-                    "matches": matches,
-                }
-            )
-            success_count += 1
-            log_json(
-                level="INFO",
-                event="insight_module_status",
-                service="api",
-                request_id=request_id,
-                tenant_id=tenant_id,
-                doc_id=doc_id,
-                module_id=module_id,
-                module_llm_status=llm_status_log,
-                fallback_reason=fallback_reason,
-                retrieved_k=len(matches),
-                doc_id_filter=doc_id,
-                top_k=effective_top_k,
-                context_chars=context_chars,
-                llm_model=model_name,
-            )
+            log_json(level="INFO", event="insight_module_status", service="api",
+                     request_id=request_id, tenant_id=tenant_id, doc_id=doc_id,
+                     module_id=module_id,
+                     module_llm_status="generated" if generated_module else "json_parse_failed",
+                     retrieved_k=len(matches), context_chars=context_chars, llm_model=model_name)
         except Exception as error:
-            log_json(
-                level="ERROR",
-                event="insight_module_generation_failed",
-                service="api",
-                request_id=request_id,
-                tenant_id=tenant_id,
-                doc_id=doc_id,
-                module_id=module_id,
-                module_title=module_title,
-                doc_id_filter=doc_id,
-                top_k=effective_top_k,
-                retrieved_k=len(matches),
-                error=type(error).__name__,
-                detail=str(error)[:500],
-            )
-            module_results.append(
-                {
-                    "module_id": module_id,
-                    "title": module_title,
-                    "status": "grounded",
-                    "error": f"Generation failed: {type(error).__name__}",
-                    "summary": fallback_brief.summary,
-                    "direct_answer": fallback_brief.direct_answer,
-                    "key_findings": fallback_brief.key_findings,
-                    "recommended_actions": fallback_brief.recommended_actions,
-                    "citations": citations,
-                    "matches": matches,
-                }
-            )
-            success_count += 1
-            log_json(
-                level="INFO",
-                event="insight_module_status",
-                service="api",
-                request_id=request_id,
-                tenant_id=tenant_id,
-                doc_id=doc_id,
-                module_id=module_id,
-                module_llm_status="fallback_polished",
-                fallback_reason="llm_failed",
-                retrieved_k=len(matches),
-                doc_id_filter=doc_id,
-                top_k=effective_top_k,
-                llm_model=model_name,
-            )
+            log_json(level="ERROR", event="insight_module_generation_failed", service="api",
+                     request_id=request_id, tenant_id=tenant_id, doc_id=doc_id,
+                     module_id=module_id, error=type(error).__name__, detail=str(error)[:500])
+
+        client_modules.append(finalize_executive_module(
+            module_id, module_title, generated_module, matches, raw_citations,
+            request_id, tenant_id, doc_id,
+        ))
+        success_count += 1
 
         if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
             time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
 
-    log_json(
-        level="INFO",
-        event="insights_generated",
-        service="api",
-        request_id=request_id,
-        tenant_id=tenant_id,
-        doc_id=doc_id,
-        doc_id_filter=doc_id,
-        module_count=len(module_results),
-        successful_modules=success_count,
-        llm_model=model_name,
-    )
-
-    # Final quality gate: every module must pass before reaching the frontend.
-    for m in module_results:
-        enforce_module_quality_gate(m, request_id, tenant_id, doc_id)
-
-    client_modules = [_insight_module_for_response(m) for m in module_results]
+    log_json(level="INFO", event="insights_generated", service="api",
+             request_id=request_id, tenant_id=tenant_id, doc_id=doc_id,
+             module_count=len(client_modules), successful_modules=success_count, llm_model=model_name)
 
     return {
         "ok": True,
