@@ -70,7 +70,7 @@ def get_tenant_id(request: Request) -> str:
 
 
 def _cors_allow_origins() -> list[str]:
-    raw = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000")
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000","https://main.d2w8aq8p8rlibl.amplifyapp.com" , "http://127.0.0.1:3000" )
     origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
     # Empty misconfiguration would block all browser origins; fall back to local dev default.
     if not origins:
