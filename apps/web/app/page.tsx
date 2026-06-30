@@ -72,6 +72,14 @@ type AskResp = {
 
 type InsightModuleStatus = "ready" | "limited_evidence" | "ok" | "grounded" | "fallback" | "failed" | "insufficient_evidence" | "error";
 
+type MetricValue = {
+  label: string;
+  actual: number;
+  target: number;
+  unit: string;
+  direction: "lower_is_better" | "higher_is_better";
+};
+
 type InsightModule = {
   module_id: string;
   title: string;
@@ -82,7 +90,9 @@ type InsightModule = {
   key_findings: (CitedText | string)[];
   recommended_actions: (CitedText | string)[];
   sources: SourceEvidence[];
-    evidence_limitations?: EvidenceLimitations;
+  evidence_limitations?: EvidenceLimitations;
+  validation_questions?: string[];
+  metrics?: MetricValue[];
   module_key?: string;
 };
 
@@ -97,12 +107,6 @@ type InsightsResp = {
 };
 
 type ChatMessage = { role: "user" | "assistant"; text: string };
-
-type InsightBrief = {
-  directAnswer: string;
-  keyFindings: string[];
-  recommendedActions: string[];
-};
 
 type InsightTab = {
   moduleId: string;
@@ -129,11 +133,11 @@ function asErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-function normalizeListLine(line: string) {
-  return line
-    .replace(/^((?:[-•*]|\d+[.)])\s+)+/, "")
-    .replace(/\s+/g, " ")
-    .trim();
+function moduleValidationQuestions(insight: InsightModule): string[] {
+  if (insight.validation_questions && insight.validation_questions.length > 0) {
+    return insight.validation_questions;
+  }
+  return insight.evidence_limitations?.validation_questions ?? [];
 }
 
 function citedTextStr(val: CitedText | string | undefined): string {
@@ -155,84 +159,80 @@ function normalizeModuleStatus(status: InsightModuleStatus): InsightModuleStatus
   return status;
 }
 
-function splitSentences(text: string) {
-  return text
-    .split(/(?<=[.!?])\s+/)
-    .map((segment) => segment.trim())
-    .filter(Boolean);
+function confidenceLabel(confidence?: string | null): string {
+  if (!confidence) return "Medium";
+  const normalized = confidence.toLowerCase();
+  if (normalized === "high") return "High";
+  if (normalized === "low") return "Low";
+  return "Medium";
 }
 
-function buildDynamicActions(question: string, findings: string[]): string[] {
-  const q = question.trim().toLowerCase();
-  const findingPreview = findings[0] ?? "";
-
-  if (/(aging|receivable|a\/r|invoice|overdue)/.test(q)) {
-    return [
-      "Review AR aging over 60 days and assign collection owners for the largest overdue balances.",
-      "Compare overdue exposure by customer segment and escalate the highest-risk accounts this cycle.",
-    ];
-  }
-  if (/(fleet|vehicle|van|maintenance)/.test(q)) {
-    return [
-      "Audit fleet maintenance costs by vehicle and prioritize units with repeat high-cost repairs.",
-      "Separate preventive vs. reactive maintenance spend and schedule interventions for outlier vans.",
-    ];
-  }
-  if (/(discount|pricing|margin|category)/.test(q)) {
-    return [
-      "Check discounting by category and flag segments where discount depth is eroding margin.",
-      "Review high-discount transactions for approval-policy breaches and adjust pricing controls.",
-    ];
-  }
-
-  const focusedQuestion =
-    question.trim().length > 90 ? `${question.trim().slice(0, 87).trimEnd()}...` : question.trim();
-  const evidenceHint = findingPreview ? ` Start with: ${findingPreview}` : "";
-  return [
-    `Drill into '${focusedQuestion}' by segment, owner, and period to isolate the highest-impact outliers.${evidenceHint}`,
-    "Translate the top cited finding into an owner, target metric, and review date for this reporting cycle.",
-  ];
+function renderMetricsChart(metrics: MetricValue[]) {
+  if (metrics.length === 0) return null;
+  return (
+    <div className="metrics-chart">
+      {metrics.map((metric) => {
+        const maxValue = Math.max(metric.actual, metric.target, 1);
+        const actualPct = Math.min(100, (metric.actual / maxValue) * 100);
+        const targetPct = Math.min(100, (metric.target / maxValue) * 100);
+        return (
+          <div key={metric.label} className="metric-row">
+            <div className="metric-head">
+              <span className="metric-label">{metric.label}</span>
+              <span className="metric-values">
+                {metric.actual}
+                {metric.unit} vs {metric.target}
+                {metric.unit}
+              </span>
+            </div>
+            <div className="metric-bars" aria-hidden>
+              <div className="metric-bar actual" style={{ width: `${actualPct}%` }} />
+              <div className="metric-bar target" style={{ width: `${targetPct}%` }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
-function buildInsightBrief(
-  answerText: string,
-  question: string,
-  serverBrief?: AskResp["brief"]
-): InsightBrief {
-  if (serverBrief) {
-    return {
-      directAnswer: serverBrief.direct_answer,
-      keyFindings: serverBrief.key_findings,
-      recommendedActions: serverBrief.recommended_next_actions,
-    };
-  }
+function renderEvidenceQualityCard(
+  insight: InsightModule,
+  sources: SourceEvidence[],
+  onViewEvidence: () => void
+) {
+  const limited = normalizeModuleStatus(insight.status) === "limited_evidence";
+  const metrics = insight.metrics ?? [];
 
-  const normalizedAnswer = answerText.replace(/\r/g, "").trim();
-  const lines = normalizedAnswer
-    .split(/\n+/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const sentenceCandidates = splitSentences(lines.join(" "));
-  const bulletFindings = lines
-    .filter((line) => /^((?:[-•*])|(?:\d+[.)]))\s+/.test(line))
-    .map(normalizeListLine)
-    .filter(Boolean);
-
-  const directAnswer = sentenceCandidates[0] ?? "No answer available yet.";
-  const keyFindings =
-    bulletFindings.length > 0
-      ? bulletFindings.slice(0, 4)
-      : sentenceCandidates.slice(1, 5).length > 0
-        ? sentenceCandidates.slice(1, 5)
-        : [directAnswer];
-
-  const compactQuestion = question.trim().replace(/\s+/g, " ");
-  const shortQuestion =
-    compactQuestion.length > 70 ? `${compactQuestion.slice(0, 67).trimEnd()}...` : compactQuestion;
-
-  const recommendedActions = buildDynamicActions(shortQuestion, keyFindings);
-  return { directAnswer, keyFindings, recommendedActions };
+  return (
+    <aside className="evidence-quality-card" aria-label="Evidence quality">
+      <p className="evidence-quality-title">Evidence quality</p>
+      {limited ? (
+        <>
+          <p className="evidence-quality-status">Limited category detail</p>
+          <p className="evidence-quality-note">Needs validation before decision</p>
+        </>
+      ) : (
+        <p className="evidence-quality-status">Source-backed diagnosis</p>
+      )}
+      <dl className="evidence-quality-meta">
+        <div>
+          <dt>Sources</dt>
+          <dd>{sources.length}</dd>
+        </div>
+        <div>
+          <dt>Confidence</dt>
+          <dd>{confidenceLabel(insight.confidence)}</dd>
+        </div>
+      </dl>
+      {sources.length > 0 && (
+        <button type="button" className="ghost-btn evidence-quality-btn" onClick={onViewEvidence}>
+          View supporting evidence
+        </button>
+      )}
+      {renderMetricsChart(metrics)}
+    </aside>
+  );
 }
 
 function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
@@ -360,7 +360,6 @@ export default function Home() {
   const [askFindings, setAskFindings] = useState<CitedText[]>([]);
   const [askRecommendations, setAskRecommendations] = useState<CitedText[]>([]);
   const [askAnswer, setAskAnswer] = useState<CitedText | null>(null);
-  const [briefFromServer, setBriefFromServer] = useState<AskResp["brief"]>();
   const [answerMode, setAnswerMode] = useState<AskResp["answer_mode"] | null>(null);
   const [evidenceNote, setEvidenceNote] = useState<string | null>(null);
   const [selectedEvidence, setSelectedEvidence] = useState<SourceEvidence | null>(null);
@@ -473,24 +472,6 @@ export default function Home() {
     setSelectedEvidence(source);
   }, []);
 
-  const insightBrief = useMemo(() => {
-    if (briefFromServer) {
-      return {
-        directAnswer: briefFromServer.direct_answer,
-        keyFindings: briefFromServer.key_findings,
-        recommendedActions: briefFromServer.recommended_next_actions,
-      };
-    }
-    if (askAnswer) {
-      return {
-        directAnswer: askAnswer.text,
-        keyFindings: askFindings.map((item) => item.text),
-        recommendedActions: askRecommendations.map((item) => item.text),
-      };
-    }
-    return buildInsightBrief(latestAssistantMessage, latestQuestion, briefFromServer);
-  }, [latestAssistantMessage, latestQuestion, briefFromServer, askAnswer, askFindings, askRecommendations]);
-
   async function fetchInsights(docId: string, clearOldInsights = false) {
     if (clearOldInsights) setInsights([]);
     setBusy("insights");
@@ -534,7 +515,6 @@ export default function Home() {
       setAskFindings([]);
       setAskRecommendations([]);
       setAskAnswer(null);
-      setBriefFromServer(undefined);
       setAnswerMode(null);
       setEvidenceNote(null);
       setSelectedEvidence(null);
@@ -559,7 +539,6 @@ export default function Home() {
     setErr(null);
     setBusy("ask");
     setAnswerMode(null);
-    setBriefFromServer(undefined);
     setAskSources([]);
     setAskFindings([]);
     setAskRecommendations([]);
@@ -582,7 +561,6 @@ export default function Home() {
         setAskFindings(resp.source_backed_findings ?? []);
         setAskRecommendations(resp.advisor_recommendations ?? []);
         setAskAnswer(typeof resp.answer === "object" ? resp.answer : { text: resp.answer ?? msg, citation_ids: [] });
-        setBriefFromServer(resp.brief);
         setEvidenceNote(resp.evidence_note ?? resp.brief?.evidence_note ?? null);
         setAnswerMode(resp.answer_mode ?? null);
         return;
@@ -599,7 +577,6 @@ export default function Home() {
       setAskFindings(resp.source_backed_findings ?? []);
       setAskRecommendations(resp.advisor_recommendations ?? []);
       setAskAnswer(answerObj);
-      setBriefFromServer(resp.brief);
       setEvidenceNote(resp.evidence_note ?? resp.brief?.evidence_note ?? null);
       setAnswerMode(resp.answer_mode ?? "rag");
     } catch (e: unknown) {
@@ -608,7 +585,6 @@ export default function Home() {
       setAskFindings([]);
       setAskRecommendations([]);
       setAskAnswer(null);
-      setBriefFromServer(undefined);
       setEvidenceNote(null);
     } finally {
       setBusy(null);
@@ -655,7 +631,6 @@ export default function Home() {
     setAskFindings([]);
     setAskRecommendations([]);
     setAskAnswer(null);
-    setBriefFromServer(undefined);
     setAnswerMode(null);
     setEvidenceNote(null);
     setSelectedEvidence(null);
@@ -675,7 +650,6 @@ export default function Home() {
     setAskFindings([]);
     setAskRecommendations([]);
     setAskAnswer(null);
-    setBriefFromServer(undefined);
     setAnswerMode(null);
     setEvidenceNote(null);
     setSelectedEvidence(null);
@@ -922,22 +896,20 @@ export default function Home() {
                     </p>
                   )}
                   {normalizeModuleStatus(selectedInsight.status) === "limited_evidence" &&
-                    (selectedInsight.evidence_limitations?.validation_questions?.length ?? 0) > 0 && (
+                    moduleValidationQuestions(selectedInsight).length > 0 && (
                       <div className="validation-questions">
                         <h4>What to validate next</h4>
                         <ul>
-                          {selectedInsight.evidence_limitations?.validation_questions.map((question, index) => (
+                          {moduleValidationQuestions(selectedInsight).map((question, index) => (
                             <li key={index}>{question}</li>
                           ))}
                         </ul>
                       </div>
                     )}
                 </div>
-                <div className="hero-visual" aria-hidden>
-                  <span />
-                  <span />
-                  <span />
-                </div>
+                {renderEvidenceQualityCard(selectedInsight, selectedSources, () => {
+                  if (selectedSources[0]) openEvidence(selectedSources[0]);
+                })}
               </article>
 
               <div className="details-grid">
@@ -1052,7 +1024,7 @@ export default function Home() {
                   <p className="ask-direct-answer">
                     {askAnswer
                       ? renderCitedContent(askAnswer, askSources, openEvidence)
-                      : renderInlineMarkdown(insightBrief.directAnswer, "ask-answer")}
+                      : renderInlineMarkdown(latestAssistantMessage, "ask-answer")}
                   </p>
 
                   {evidenceNote && <p className="evidence-note">{evidenceNote}</p>}
@@ -1060,26 +1032,28 @@ export default function Home() {
                   <div className="ask-details-grid">
                     <section>
                       <h4>Source-backed Findings</h4>
-                      <ul>
-                        {(askFindings.length > 0
-                          ? askFindings
-                          : insightBrief.keyFindings.map((text) => ({ text, citation_ids: [] as number[] }))
-                        ).map((finding, index) => (
-                          <li key={index}>{renderCitedContent(finding, askSources, openEvidence)}</li>
-                        ))}
-                      </ul>
+                      {askFindings.length > 0 ? (
+                        <ul>
+                          {askFindings.map((finding, index) => (
+                            <li key={index}>{renderCitedContent(finding, askSources, openEvidence)}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="helper-note">No source-backed findings were returned.</p>
+                      )}
                     </section>
 
                     <section>
                       <h4>Advisor Recommendations</h4>
-                      <ul>
-                        {(askRecommendations.length > 0
-                          ? askRecommendations
-                          : insightBrief.recommendedActions.map((text) => ({ text, citation_ids: [] as number[] }))
-                        ).map((action, index) => (
-                          <li key={index}>{renderCitedContent(action, askSources, openEvidence)}</li>
-                        ))}
-                      </ul>
+                      {askRecommendations.length > 0 ? (
+                        <ul>
+                          {askRecommendations.map((action, index) => (
+                            <li key={index}>{renderCitedContent(action, askSources, openEvidence)}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="helper-note">No advisor recommendations were returned.</p>
+                      )}
                     </section>
                   </div>
                 </article>
