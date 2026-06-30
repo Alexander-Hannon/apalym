@@ -42,9 +42,9 @@ type SourceEvidence = {
 };
 
 type EvidenceLimitations = {
-  has_limitations: boolean;
   message: string | null;
   validation_questions: string[];
+  has_limitations?: boolean;
 };
 
 type AskResp = {
@@ -82,7 +82,8 @@ type InsightModule = {
   key_findings: (CitedText | string)[];
   recommended_actions: (CitedText | string)[];
   sources: SourceEvidence[];
-  evidence_limitations?: EvidenceLimitations;
+    evidence_limitations?: EvidenceLimitations;
+  module_key?: string;
 };
 
 type InsightsResp = {
@@ -920,12 +921,12 @@ export default function Home() {
                       {statusHintForInsight(selectedInsight.status, selectedInsight.evidence_limitations)}
                     </p>
                   )}
-                  {selectedInsight.evidence_limitations?.has_limitations &&
-                    (selectedInsight.evidence_limitations.validation_questions?.length ?? 0) > 0 && (
+                  {normalizeModuleStatus(selectedInsight.status) === "limited_evidence" &&
+                    (selectedInsight.evidence_limitations?.validation_questions?.length ?? 0) > 0 && (
                       <div className="validation-questions">
                         <h4>What to validate next</h4>
                         <ul>
-                          {selectedInsight.evidence_limitations.validation_questions.map((question, index) => (
+                          {selectedInsight.evidence_limitations?.validation_questions.map((question, index) => (
                             <li key={index}>{question}</li>
                           ))}
                         </ul>
@@ -995,7 +996,7 @@ export default function Home() {
                 </section>
               </div>
 
-              {selectedInsight.evidence_limitations?.has_limitations && selectedSources.length > 0 && (
+              {normalizeModuleStatus(selectedInsight.status) === "limited_evidence" && selectedSources.length > 0 && (
                 <div className="view-sources-row">
                   <button type="button" className="ghost-btn" onClick={() => openEvidence(selectedSources[0])}>
                     View source evidence
