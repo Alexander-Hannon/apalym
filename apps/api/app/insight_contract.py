@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 InsightStatus = Literal["ready", "limited_evidence"]
 InsightConfidence = Literal["high", "medium", "low"]
+MetricDirection = Literal["lower_is_better", "higher_is_better"]
 
 
 class CitedField(BaseModel):
@@ -29,6 +30,14 @@ class SourceEvidence(BaseModel):
     title: str = "Source evidence"
 
 
+class MetricValue(BaseModel):
+    label: str
+    actual: float
+    target: float
+    unit: str = ""
+    direction: MetricDirection = "lower_is_better"
+
+
 class EvidenceLimitations(BaseModel):
     message: str | None = None
     validation_questions: list[str] = Field(default_factory=list)
@@ -45,6 +54,8 @@ class InsightModuleOutput(BaseModel):
     recommended_actions: list[CitedField]
     evidence_limitations: EvidenceLimitations
     sources: list[SourceEvidence]
+    validation_questions: list[str] = Field(default_factory=list)
+    metrics: list[MetricValue] = Field(default_factory=list)
     summary: CitedField | None = None
 
 
@@ -60,7 +71,9 @@ _BRACKETED_INTERNAL_ID = re.compile(
     r"\[[0-9a-f]{8}-[0-9a-f-]{27,}:\d+\]",
     re.IGNORECASE,
 )
-_CITATION_SYNTAX_IN_TEXT = re.compile(r"\[\s*\d{1,2}\s*\]|\[[^\]]*:[^\]]+\]")
+_CITATION_SYNTAX_IN_TEXT = re.compile(
+    r"\[\s*\d{1,2}(?:\s*,\s*\d{1,2})*\s*\]|\[[^\]]*:[^\]]+\]"
+)
 _INTERNAL_FIELD_NAMES = re.compile(
     r"\b(?:chunk_id|doc_id|source_id|metadata|namespace)\b",
     re.IGNORECASE,
@@ -112,6 +125,7 @@ def text_is_substantive(text: str, *, min_len: int = 24) -> bool:
 
 
 def strip_inline_citations_from_text(text: str) -> str:
+    """Legacy helper for non-user-facing fields only (e.g. evidence_note)."""
     cleaned = text or ""
     cleaned = _BRACKETED_INTERNAL_ID.sub("", cleaned)
     cleaned = _UUID_CHUNK_PATTERN.sub("", cleaned)
@@ -142,7 +156,10 @@ def parse_cited_field(
     if not ids and fallback_ids:
         ids = [item for item in fallback_ids if 1 <= item <= max_sources]
 
-    clean_text = strip_inline_citations_from_text(raw_text)
+    clean_text = compact_whitespace(raw_text)
+    if text_has_internal_artifact(clean_text) or text_has_citation_syntax(clean_text):
+        clean_text = ""
+
     return CitedField(text=clean_text, citation_ids=ids)
 
 
@@ -185,6 +202,9 @@ def validate_module_output(module: InsightModuleOutput) -> tuple[bool, list[str]
     if len(module.key_findings) < 2:
         reasons.append("key_findings_too_short")
     else:
+        normalized_findings = [compact_whitespace(finding.text).lower() for finding in module.key_findings]
+        if len(set(normalized_findings)) != len(normalized_findings):
+            reasons.append("key_findings_duplicates")
         for index, finding in enumerate(module.key_findings):
             reasons.extend(validate_cited_field(finding, max_sources=max_sources, field_name=f"key_findings_{index}"))
 
@@ -211,12 +231,25 @@ def validate_module_output(module: InsightModuleOutput) -> tuple[bool, list[str]
                 reasons.append("citation_id_unmapped")
 
     if module.status == "limited_evidence":
+        questions = module.validation_questions or module.evidence_limitations.validation_questions
         if not module.evidence_limitations.message:
             reasons.append("limited_evidence_message_missing")
-        if len(module.evidence_limitations.validation_questions) < 2:
+        if len(questions) < 2:
             reasons.append("validation_questions_too_short")
 
     return (len(reasons) == 0, sorted(set(reasons)))
+
+
+def module_has_visible_artifacts(module: InsightModuleOutput) -> bool:
+    texts = [
+        module.direct_answer.text,
+        *[item.text for item in module.key_findings],
+        *[item.text for item in module.recommended_actions],
+        module.evidence_limitations.message or "",
+        *module.validation_questions,
+        *module.evidence_limitations.validation_questions,
+    ]
+    return any(text_has_internal_artifact(text) for text in texts if compact_whitespace(text))
 
 
 def build_insight_generation_instruction(module_title: str, retrieval_query: str) -> str:
@@ -248,6 +281,49 @@ def build_insight_repair_instruction(module_title: str, retrieval_query: str, fa
 
 
 LIMITED_EVIDENCE_COPY: dict[str, dict[str, Any]] = {
+    "losses": {
+        "direct_answer": (
+            "The available document indicates operating pressure from labor overtime and transportation "
+            "utilization, but it does not provide enough clean category-level detail to rank the largest "
+            "sources of profit leakage with confidence."
+        ),
+        "key_findings": [
+            "Warehouse overtime appears above the operating target.",
+            "Truck utilization appears below the planned efficiency level.",
+            "Collections timing may be affecting cash conversion.",
+        ],
+        "recommended_actions": [
+            "Validate overtime by location, shift, and supervisor before reallocating labor.",
+            "Compare truck utilization by lane and customer to isolate underused capacity.",
+            "Review disputed receivables and collection timing against the cash plan.",
+        ],
+        "validation_questions": [
+            "What is gross margin by customer, route, location, and service line?",
+            "Which labor, freight, claims, or pricing drivers explain the largest variance?",
+            "Which loss categories are recurring versus one-time in the current period?",
+        ],
+    },
+    "costs": {
+        "direct_answer": (
+            "The available document signals cost pressure in labor and transportation, but it does not "
+            "provide enough clean category-level detail to isolate the top recurring cost drivers with confidence."
+        ),
+        "key_findings": [
+            "Labor overtime appears elevated relative to plan.",
+            "Transportation utilization may be below the efficiency target.",
+            "Operating cost variances may be concentrated in a few controllable categories.",
+        ],
+        "recommended_actions": [
+            "Break down unfavorable cost variances by site, shift, and vendor.",
+            "Separate recurring labor and freight costs from one-time items.",
+            "Prioritize the largest controllable categories for a 30-day cost review.",
+        ],
+        "validation_questions": [
+            "Which cost categories are above budget versus prior period by operating unit?",
+            "What recurring versus one-time costs explain the largest unfavorable variance?",
+            "Which vendors or contracts drive the top three cost overruns?",
+        ],
+    },
     "risks": {
         "direct_answer": (
             "The available document indicates potential capital-execution, labor, and compliance risk, "
@@ -269,6 +345,48 @@ LIMITED_EVIDENCE_COPY: dict[str, dict[str, Any]] = {
             "What financial exposure is tied to claims, credits, or compliance events?",
         ],
     },
+    "margins": {
+        "direct_answer": (
+            "The available document suggests margin pressure from labor, freight, and collections timing, "
+            "but it does not provide enough clean category-level detail to quantify margin leakage with confidence."
+        ),
+        "key_findings": [
+            "Labor overtime may be compressing contribution margin.",
+            "Transportation underutilization may be raising per-unit delivery cost.",
+            "Collections delays may be masking working-capital pressure.",
+        ],
+        "recommended_actions": [
+            "Reconcile margin by customer, route, and service line after fully loaded costs.",
+            "Audit pricing, discounting, and claims leakage against margin targets.",
+            "Review billing accuracy and dispute resolution for high-exposure accounts.",
+        ],
+        "validation_questions": [
+            "What is margin by customer, route, and service line after fully loaded costs?",
+            "Which pricing, labor, claims, or billing gaps explain the largest margin leakage?",
+            "Which customers or lanes are below target contribution margin?",
+        ],
+    },
+    "trends": {
+        "direct_answer": (
+            "The available document shows movement in labor, transportation, and collections metrics, "
+            "but it does not provide enough clean time-series detail to confirm durable trends with confidence."
+        ),
+        "key_findings": [
+            "Labor overtime may be trending above the operating plan.",
+            "Transportation utilization may be drifting below target efficiency.",
+            "Collections timing may be worsening relative to the cash plan.",
+        ],
+        "recommended_actions": [
+            "Compare the last three reporting periods for overtime, utilization, and DSO.",
+            "Separate recurring trend shifts from one-time operational events.",
+            "Set weekly review checkpoints on the top three moving metrics.",
+        ],
+        "validation_questions": [
+            "Which metrics changed materially over the last three to six periods?",
+            "Are recent variances recurring or driven by one-time events?",
+            "Which operating KPIs should be tracked weekly until the trend stabilizes?",
+        ],
+    },
 }
 
 
@@ -276,28 +394,10 @@ def category_validation_questions(module_key: str) -> list[str]:
     keyed = LIMITED_EVIDENCE_COPY.get(module_key, {}).get("validation_questions")
     if isinstance(keyed, list) and len(keyed) >= 2:
         return keyed
-    defaults = {
-        "losses": [
-            "What is gross margin by customer, route, location, and service line?",
-            "Which labor, freight, claims, or pricing drivers explain the largest variance?",
-        ],
-        "costs": [
-            "Which cost categories are above budget versus prior period by operating unit?",
-            "What recurring versus one-time costs explain the largest unfavorable variance?",
-        ],
-        "margins": [
-            "What is margin by customer, route, and service line after fully loaded costs?",
-            "Which pricing, labor, claims, or billing gaps explain the largest margin leakage?",
-        ],
-        "trends": [
-            "Which metrics changed materially over the last three to six periods?",
-            "Are recent variances recurring or driven by one-time events?",
-        ],
-    }
-    return defaults.get(module_key, [
+    return [
         "What supporting schedules or department-level detail would confirm this diagnosis?",
         "Which operating metrics should be validated before acting on these recommendations?",
-    ])
+    ]
 
 
 def build_limited_evidence_module(
@@ -306,14 +406,13 @@ def build_limited_evidence_module(
     module_id: str,
     title: str,
     sources: list[SourceEvidence],
-    fallback_copy: dict[str, Any],
-    partial: dict[str, Any] | None = None,
 ) -> InsightModuleOutput:
     max_sources = max(len(sources), 1)
-    category_copy = LIMITED_EVIDENCE_COPY.get(module_key, {})
-    direct_text = category_copy.get("direct_answer") or fallback_copy.get("direct_answer", "")
-    findings_text = category_copy.get("key_findings") or fallback_copy.get("key_findings", [])
-    actions_text = category_copy.get("recommended_actions") or fallback_copy.get("recommended_actions", [])
+    category_copy = LIMITED_EVIDENCE_COPY.get(module_key, LIMITED_EVIDENCE_COPY["losses"])
+    direct_text = category_copy["direct_answer"]
+    findings_text = category_copy["key_findings"]
+    actions_text = category_copy["recommended_actions"]
+    validation_questions = category_validation_questions(module_key)
 
     direct_answer = parse_cited_field(direct_text, max_sources=max_sources, fallback_ids=[])
     key_findings = [
@@ -324,25 +423,6 @@ def build_limited_evidence_module(
         parse_cited_field(item, max_sources=max_sources, fallback_ids=[1] if sources else [])
         for item in actions_text[:3]
     ]
-
-    if partial:
-        candidate = partial.get("direct_answer")
-        if isinstance(candidate, CitedField) and text_is_substantive(candidate.text) and not text_has_internal_artifact(candidate.text):
-            direct_answer = candidate
-
-        partial_findings = [
-            item for item in (partial.get("key_findings") or [])
-            if isinstance(item, CitedField) and text_is_substantive(item.text) and not text_has_internal_artifact(item.text)
-        ]
-        if len(partial_findings) >= 2:
-            key_findings = partial_findings[:3]
-
-        partial_actions = [
-            item for item in (partial.get("recommended_actions") or [])
-            if isinstance(item, CitedField) and text_is_substantive(item.text) and not text_is_generic_placeholder(item.text)
-        ]
-        if len(partial_actions) >= 2:
-            recommended_actions = partial_actions[:3]
 
     message = (
         "This diagnosis is based on limited evidence. Review the supporting excerpts and "
@@ -361,9 +441,11 @@ def build_limited_evidence_module(
         recommended_actions=recommended_actions,
         evidence_limitations=EvidenceLimitations(
             message=message,
-            validation_questions=category_validation_questions(module_key),
+            validation_questions=validation_questions,
         ),
+        validation_questions=validation_questions,
         sources=sources,
+        metrics=[],
     )
 
 
@@ -411,7 +493,6 @@ def finalize_insight_module(
     title: str,
     generated: dict[str, Any] | None,
     source_packets: list[dict[str, Any]],
-    fallback_copy: dict[str, Any],
 ) -> tuple[InsightModuleOutput, list[str]]:
     sources = build_public_sources(source_packets)
     max_sources = len(sources)
@@ -424,7 +505,6 @@ def finalize_insight_module(
                 module_id=module_id,
                 title=title,
                 sources=sources,
-                fallback_copy=fallback_copy,
             ),
             ["no_sources_or_generation"],
         )
@@ -437,7 +517,6 @@ def finalize_insight_module(
                 module_id=module_id,
                 title=title,
                 sources=sources,
-                fallback_copy=fallback_copy,
             ),
             ["parse_failed"],
         )
@@ -453,8 +532,6 @@ def finalize_insight_module(
                 module_id=module_id,
                 title=title,
                 sources=sources,
-                fallback_copy=fallback_copy,
-                partial=parsed,
             ),
             ["direct_answer_not_usable"],
         )
@@ -466,8 +543,6 @@ def finalize_insight_module(
                 module_id=module_id,
                 title=title,
                 sources=sources,
-                fallback_copy=fallback_copy,
-                partial=parsed,
             ),
             ["insufficient_findings_or_actions"],
         )
@@ -484,7 +559,9 @@ def finalize_insight_module(
         key_findings=key_findings[:4],
         recommended_actions=recommended_actions[:4],
         evidence_limitations=EvidenceLimitations(message=None, validation_questions=[]),
+        validation_questions=[],
         sources=sources,
+        metrics=[],
     )
 
     ok, reasons = validate_module_output(module)
@@ -497,12 +574,29 @@ def finalize_insight_module(
             module_id=module_id,
             title=title,
             sources=sources,
-            fallback_copy=fallback_copy,
-            partial=parsed,
         ),
         reasons,
     )
 
 
+def serialize_module_for_api(module: InsightModuleOutput) -> dict[str, Any]:
+    """Final backend validator immediately before API serialization."""
+    ok, _ = validate_module_output(module)
+    if not ok or module_has_visible_artifacts(module):
+        module = build_limited_evidence_module(
+            module_key=module.module_key,
+            module_id=module.module_id,
+            title=module.title,
+            sources=module.sources,
+        )
+
+    payload = module.model_dump()
+    if module.status == "limited_evidence":
+        payload["validation_questions"] = module.validation_questions or module.evidence_limitations.validation_questions
+    else:
+        payload["validation_questions"] = []
+    return payload
+
+
 def module_to_response_dict(module: InsightModuleOutput) -> dict[str, Any]:
-    return module.model_dump()
+    return serialize_module_for_api(module)

@@ -174,17 +174,6 @@ class CitationContractTests(unittest.TestCase):
             module_id="loss-leakage",
             title="Where are we losing money?",
             sources=build_public_sources(packets),
-            fallback_copy={
-                "direct_answer": "The document does not provide enough clean detail to make a definitive loss diagnosis.",
-                "key_findings": [
-                    "Warehouse overtime appears above target.",
-                    "Truck utilization appears below target.",
-                ],
-                "recommended_actions": [
-                    "Validate overtime by location, shift, and supervisor.",
-                    "Compare truck utilization by lane and customer.",
-                ],
-            },
         )
         self.assertEqual(module.status, "limited_evidence")
         self.assertGreaterEqual(len(module.evidence_limitations.validation_questions), 2)

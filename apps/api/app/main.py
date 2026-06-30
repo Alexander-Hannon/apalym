@@ -20,9 +20,10 @@ from app.insight_contract import (
     build_insight_repair_instruction,
     build_limited_evidence_module,
     build_public_sources,
-    finalize_insight_module,
+    finalize_insight_module as finalize_insight_module_contract,
     module_to_response_dict,
     parse_cited_field,
+    serialize_module_for_api,
     strip_inline_citations_from_text,
     text_has_internal_artifact,
     text_is_generic_placeholder,
@@ -522,8 +523,6 @@ def is_generic_action(text: str) -> bool:
 
 def build_dynamic_fallback_actions(query_text: str, matches: list[dict[str, Any]]) -> list[str]:
     q = compact_whitespace(query_text).lower()
-    top_match_text = compact_whitespace((matches[0].get("text") if matches else "") or "")
-    snippet = top_match_text[:140] + ("..." if len(top_match_text) > 140 else "")
 
     if any(token in q for token in ("aging", "receivable", "ar ", "a/r", "invoice")):
         return [
@@ -546,9 +545,10 @@ def build_dynamic_fallback_actions(query_text: str, matches: list[dict[str, Any]
             "Analyze drivers shared across churn-risk accounts and feed the top driver into next-cycle account plans."
         ]
 
-    generic = f"Run a focused drill-down on '{compact_whitespace(query_text)}' by segment, owner, and period to isolate decision-ready outliers."
-    if snippet:
-        generic += f" Start with this evidence thread: {snippet}"
+    generic = (
+        f"Run a focused drill-down on '{compact_whitespace(query_text)}' by segment, owner, and period "
+        "to isolate decision-ready outliers."
+    )
     return [
         generic,
         "Convert the top finding into an operational action owner, target metric, and review date for this reporting cycle.",
@@ -1009,9 +1009,8 @@ def format_source_packet_block(packet: dict[str, Any]) -> str:
     page_line = f"Page: {packet['page']}" if packet.get("page") else "Page: unknown"
     return (
         f"{packet['label']}\n"
-        f"Document: {packet.get('document_name', 'Uploaded document')}\n"
         f"{page_line}\n"
-        f"Evidence:\n{packet['excerpt']}"
+        f"Evidence: {packet['excerpt']}"
     )
 
 
@@ -2745,13 +2744,12 @@ def generate_insights(req: InsightsRequest, request: Request):
                 detail=str(error)[:500],
             )
             client_modules.append(
-                module_to_response_dict(
+                serialize_module_for_api(
                     build_limited_evidence_module(
                         module_key=normalize_module_key(module_id, module_title),
                         module_id=module_id,
                         title=module_title,
                         sources=[],
-                        fallback_copy=get_module_fallback_copy(module_id, module_title),
                     )
                 )
             )
@@ -2768,13 +2766,12 @@ def generate_insights(req: InsightsRequest, request: Request):
 
         if not source_packets:
             client_modules.append(
-                module_to_response_dict(
+                serialize_module_for_api(
                     build_limited_evidence_module(
                         module_key=normalize_module_key(module_id, module_title),
                         module_id=module_id,
                         title=module_title,
                         sources=[],
-                        fallback_copy=get_module_fallback_copy(module_id, module_title),
                     )
                 )
             )
@@ -2790,7 +2787,7 @@ def generate_insights(req: InsightsRequest, request: Request):
             max_total_chars=INSIGHT_MAX_CONTEXT_CHARS,
             document_name=document_name,
         )
-        context_block = "\n\n---\n\n".join(snippets)
+        context_block = "\n\n".join(snippets)
         module_instruction = build_insight_generation_instruction(module_title, retrieval_query)
         full_prompt = (
             f"{module_instruction}\n"
@@ -2800,7 +2797,6 @@ def generate_insights(req: InsightsRequest, request: Request):
 
         generated_module: dict[str, Any] | None = None
         module_key = normalize_module_key(module_id, module_title)
-        fallback_copy = get_module_fallback_copy(module_id, module_title)
         try:
             resp = generate_content_with_retry(
                 gemini=gemini,
@@ -2846,13 +2842,12 @@ def generate_insights(req: InsightsRequest, request: Request):
                 detail=str(error)[:500],
             )
 
-        module_output, failure_reasons = finalize_insight_module(
+        module_output, failure_reasons = finalize_insight_module_contract(
             module_key=module_key,
             module_id=module_id,
             title=module_title,
             generated=generated_module,
             source_packets=source_packets,
-            fallback_copy=fallback_copy,
         )
 
         if failure_reasons and generated_module is not None:
@@ -2877,13 +2872,12 @@ def generate_insights(req: InsightsRequest, request: Request):
                     repair_text = repair_resp.get("text")
                 repaired_obj = parse_model_json(repair_text or "")
                 if repaired_obj is not None:
-                    module_output, failure_reasons = finalize_insight_module(
+                    module_output, failure_reasons = finalize_insight_module_contract(
                         module_key=module_key,
                         module_id=module_id,
                         title=module_title,
                         generated=repaired_obj,
                         source_packets=source_packets,
-                        fallback_copy=fallback_copy,
                     )
                     log_json(
                         level="INFO",
@@ -2909,7 +2903,7 @@ def generate_insights(req: InsightsRequest, request: Request):
                     detail=str(repair_error)[:300],
                 )
 
-        finalized = module_to_response_dict(module_output)
+        finalized = serialize_module_for_api(module_output)
         if finalized.get("status") == "limited_evidence":
             modules_using_fallback.append(module_id)
         if failure_reasons:
@@ -2963,16 +2957,12 @@ def generate_insights(req: InsightsRequest, request: Request):
                 continue
             if visible_module_uuid_locations(module):
                 repaired_modules.append(
-                    module_to_response_dict(
+                    serialize_module_for_api(
                         build_limited_evidence_module(
                             module_key=normalize_module_key(module.get("module_id", ""), module.get("title", "")),
                             module_id=module.get("module_id", ""),
                             title=module.get("title", ""),
                             sources=[],
-                            fallback_copy=get_module_fallback_copy(
-                                module.get("module_id", ""),
-                                module.get("title", ""),
-                            ),
                         )
                     )
                 )
@@ -3183,19 +3173,13 @@ def ask(req: AskRequest, request: Request):
         )
         fallback_brief = AskBrief(
             direct_answer=(
-                "The AI analysis could not be completed for this question, but the following "
-                "points are drawn from retrieved excerpts in your document."
+                "The AI analysis could not be completed for this question based on the available document evidence. "
+                "Try rephrasing the question or asking about a specific operating metric."
             ),
-            key_findings=[
-                packet["excerpt"]
-                for packet in source_packets[:3]
-                if compact_whitespace(packet.get("excerpt", ""))
-            ] or [
-                "The available source excerpts could not be cleanly summarized. Try rephrasing or asking about a specific aspect of the document."
-            ],
+            key_findings=[],
             recommended_next_actions=build_dynamic_fallback_actions(query_text, matches)[:4],
             confidence="Low",
-            evidence_note="This is a source-grounded fallback. AI generation was unavailable for this request.",
+            evidence_note="This is an advisor fallback. AI generation was unavailable for this request.",
         )
         structured = finalize_ask_response(query_text, fallback_brief, fallback_brief.direct_answer, source_packets)
         return {

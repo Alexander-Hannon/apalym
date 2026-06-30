@@ -8,6 +8,7 @@ from app.insight_contract import (
     build_limited_evidence_module,
     finalize_insight_module,
     parse_cited_field,
+    serialize_module_for_api,
     strip_inline_citations_from_text,
     text_has_citation_syntax,
     text_has_internal_artifact,
@@ -16,13 +17,14 @@ from app.insight_contract import (
 
 
 class InsightContractResetTests(unittest.TestCase):
-    def test_text_fields_strip_citation_syntax(self):
+    def test_text_fields_reject_citation_syntax_in_prose(self):
         cited = parse_cited_field(
             {"text": "Labor pressure is rising. [1, 2]", "citation_ids": [1, 2]},
             max_sources=3,
         )
         self.assertEqual(cited.citation_ids, [1, 2])
-        self.assertFalse(text_has_citation_syntax(cited.text))
+        self.assertEqual(cited.text, "")
+        self.assertTrue(text_has_citation_syntax("Labor pressure is rising. [1, 2]"))
 
     def test_internal_uuid_bracket_rejected(self):
         text = "Issue found [c394bf1b-9bce-4a35-9601-23632478f468:67]"
@@ -91,16 +93,42 @@ class InsightContractResetTests(unittest.TestCase):
                     "title": "Source evidence",
                 }
             ],
-            fallback_copy={
-                "direct_answer": "Fallback answer.",
-                "key_findings": ["Finding one.", "Finding two."],
-                "recommended_actions": ["Action one.", "Action two."],
-            },
         )
         self.assertEqual(module.status, "limited_evidence")
         self.assertGreaterEqual(len(module.evidence_limitations.validation_questions), 2)
         self.assertFalse(text_has_internal_artifact(module.direct_answer.text))
+        self.assertNotIn("ductivity", module.direct_answer.text.lower())
         self.assertTrue(reasons)
+
+    def test_serialize_rebuilds_contaminated_ready_module(self):
+        contaminated = InsightModuleOutput(
+            module_key="losses",
+            module_id="loss-leakage",
+            title="Where are we losing money?",
+            status="ready",
+            confidence="high",
+            direct_answer=CitedField(text="ductivity problem Warehouse overtime % 11.8%", citation_ids=[1]),
+            key_findings=[
+                CitedField(text="Finding one.", citation_ids=[1]),
+                CitedField(text="Finding two.", citation_ids=[1]),
+            ],
+            recommended_actions=[
+                CitedField(text="Action one.", citation_ids=[1]),
+                CitedField(text="Action two.", citation_ids=[1]),
+            ],
+            evidence_limitations=EvidenceLimitations(message=None, validation_questions=[]),
+            sources=[
+                SourceEvidence(
+                    citation_id=1,
+                    document_name="meridian_cold_chain_financial_package.pdf",
+                    page=7,
+                    excerpt="Warehouse overtime was 10.4% against a target below 7.5%.",
+                )
+            ],
+        )
+        payload = serialize_module_for_api(contaminated)
+        self.assertEqual(payload["status"], "limited_evidence")
+        self.assertFalse(text_has_internal_artifact(payload["direct_answer"]["text"]))
 
 
 if __name__ == "__main__":
