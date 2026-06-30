@@ -28,25 +28,23 @@ type IndexResp = {
   request_id: string;
 };
 
-type Citation = {
-  source_id: string;
-  doc_id?: string | null;
-  chunk_id?: string | null;
-  start?: number | null;
-  end?: number | null;
-  score?: number | null;
+type CitedText = {
+  text: string;
+  citation_ids: number[];
 };
 
-type RetrievalMatch = {
-  id: string;
-  score?: number;
-  text: string;
-  metadata?: {
-    doc_id?: string;
-    chunk_id?: string;
-    start?: number;
-    end?: number;
-  };
+type SourceEvidence = {
+  citation_id: number;
+  title: string;
+  page?: number | null;
+  excerpt: string;
+  document_name: string;
+};
+
+type EvidenceLimitations = {
+  has_limitations: boolean;
+  message: string | null;
+  validation_questions: string[];
 };
 
 type AskResp = {
@@ -54,8 +52,11 @@ type AskResp = {
   tenant_id: string;
   request_id: string;
   query: string;
-  answer?: string;
+  answer?: CitedText | string;
   answer_mode?: "rag" | "extractive" | "advisor";
+  source_backed_findings?: CitedText[];
+  advisor_recommendations?: CitedText[];
+  sources?: SourceEvidence[];
   brief?: {
     direct_answer: string;
     key_findings: string[];
@@ -63,26 +64,13 @@ type AskResp = {
     confidence?: string | null;
     evidence_note?: string | null;
   };
-  citations?: Citation[];
-  matches?: RetrievalMatch[];
+  confidence?: string | null;
+  evidence_note?: string | null;
   error?: string;
   message?: string;
 };
 
-type InsightModuleStatus = "ok" | "limited_evidence" | "grounded" | "fallback" | "failed" | "insufficient_evidence" | "error";
-
-type CitedText = {
-  text: string;
-  citation_ids: number[];
-};
-
-type StructuredCitation = {
-  id: number;
-  source_id: string;
-  excerpt_label: string;
-  excerpt: string;
-  confidence: "high" | "medium" | "low";
-};
+type InsightModuleStatus = "ready" | "limited_evidence" | "ok" | "grounded" | "fallback" | "failed" | "insufficient_evidence" | "error";
 
 type InsightModule = {
   module_id: string;
@@ -93,9 +81,8 @@ type InsightModule = {
   direct_answer: CitedText | string;
   key_findings: (CitedText | string)[];
   recommended_actions: (CitedText | string)[];
-  limitations?: string[];
-  assumptions?: string[];
-  citations: (StructuredCitation | Citation)[];
+  sources: SourceEvidence[];
+  evidence_limitations?: EvidenceLimitations;
 };
 
 type InsightsResp = {
@@ -148,26 +135,6 @@ function normalizeListLine(line: string) {
     .trim();
 }
 
-function normalizeCitationToken(raw: string): string {
-  return raw.replace(/^\[|\]$/g, "").replace(/\s+/g, "").toLowerCase();
-}
-
-function splitCitationCandidates(tagPayload: string): string[] {
-  return tagPayload
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => normalizeCitationToken(part));
-}
-
-function stripRawUuidCitationNoise(text: string): string {
-  if (!text) return text;
-  return text
-    .replace(/\[[0-9a-f]{8}-[0-9a-f-]{27}(?:\s*,\s*[0-9a-f]{8}-[0-9a-f-]{27})*\]/gi, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
 function citedTextStr(val: CitedText | string | undefined): string {
   if (!val) return "";
   if (typeof val === "string") return val;
@@ -179,8 +146,12 @@ function citedTextIds(val: CitedText | string | undefined): number[] {
   return val.citation_ids || [];
 }
 
-function isStructuredCitation(c: StructuredCitation | Citation): c is StructuredCitation {
-  return typeof (c as StructuredCitation).id === "number" && "excerpt" in c;
+function normalizeModuleStatus(status: InsightModuleStatus): InsightModuleStatus {
+  if (status === "ok") return "ready";
+  if (status === "grounded" || status === "fallback" || status === "insufficient_evidence") {
+    return "limited_evidence";
+  }
+  return status;
 }
 
 function splitSentences(text: string) {
@@ -290,56 +261,62 @@ function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
   return nodes.length > 0 ? nodes : [<span key={`${keyPrefix}-full`}>{text}</span>];
 }
 
-function renderTextWithCitationChips(text: string, citationOrder: Map<string, number>): ReactNode[] {
-  const cleanedText = stripRawUuidCitationNoise(text);
-  return cleanedText
-    .split(/(\[[^\]]+:[^\]]+\])/g)
-    .filter(Boolean)
-    .flatMap((part, index) => {
-      const tag = part.match(/^\[([^\]]+:[^\]]+)\]$/)?.[1];
-      if (!tag) return renderInlineMarkdown(part, `txt-${index}`);
-
-      const candidateOrders = splitCitationCandidates(tag)
-        .map((candidate) => citationOrder.get(candidate))
-        .filter((value): value is number => typeof value === "number");
-      const uniqueOrders = Array.from(new Set(candidateOrders));
-      if (uniqueOrders.length === 0) return [];
-
-      return uniqueOrders.map((order, citationIdx) => (
-        <span key={`tag-${index}-${citationIdx}`} className="citation-chip">
-          [{order}]
-        </span>
-      ));
-    });
+function renderCitationBadges(
+  citationIds: number[],
+  sources: SourceEvidence[],
+  onSelect: (source: SourceEvidence) => void
+): ReactNode {
+  if (citationIds.length === 0) return null;
+  return (
+    <span className="citation-pills">
+      {citationIds.map((id) => {
+        const source = sources.find((item) => item.citation_id === id);
+        return (
+          <button
+            key={id}
+            type="button"
+            className="citation-chip citation-chip-btn"
+            title={source ? `View source ${id}` : `Source ${id}`}
+            onClick={() => source && onSelect(source)}
+          >
+            {id}
+          </button>
+        );
+      })}
+    </span>
+  );
 }
 
-function buildCitationOrder(citations: Citation[]): Map<string, number> {
-  const lookup = new Map<string, number>();
-  citations.forEach((citation, index) => {
-    lookup.set(normalizeCitationToken(citation.source_id), index + 1);
-    if (citation.doc_id && citation.chunk_id) {
-      lookup.set(normalizeCitationToken(`${citation.doc_id}:${citation.chunk_id}`), index + 1);
-    }
-  });
-  return lookup;
+function renderCitedContent(
+  value: CitedText | string | undefined,
+  sources: SourceEvidence[],
+  onSelect: (source: SourceEvidence) => void
+): ReactNode {
+  const text = citedTextStr(value);
+  const ids = citedTextIds(value);
+  return (
+    <>
+      {renderInlineMarkdown(text, "cited")}
+      {renderCitationBadges(ids, sources, onSelect)}
+    </>
+  );
 }
 
-function statusHintForInsight(status: InsightModuleStatus): string {
-  if (status === "ok") return "";
-  if (status === "limited_evidence" || status === "insufficient_evidence") {
-    return "This diagnosis is based on limited source evidence and should be validated with supporting data.";
-  }
-  if (status === "grounded" || status === "fallback") {
+function statusHintForInsight(status: InsightModuleStatus, limitations?: EvidenceLimitations): string {
+  const normalized = normalizeModuleStatus(status);
+  if (normalized === "ready") return "";
+  if (limitations?.message) return limitations.message;
+  if (normalized === "limited_evidence") {
     return "This diagnosis is based on limited source evidence and should be validated with supporting data.";
   }
   return "This module could not be fully assembled for this run. Try regenerating or ask a follow-up question.";
 }
 
 function statusBadgeLabel(status: InsightModuleStatus): string | null {
-  if (status === "ok") return null;
-  if (status === "limited_evidence" || status === "insufficient_evidence") return "Limited evidence";
-  if (status === "grounded" || status === "fallback") return "Needs validation";
-  if (status === "failed" || status === "error") return "Unavailable";
+  const normalized = normalizeModuleStatus(status);
+  if (normalized === "ready") return null;
+  if (normalized === "limited_evidence") return "Needs validation";
+  if (normalized === "failed" || normalized === "error") return "Unavailable";
   return null;
 }
 
@@ -355,13 +332,6 @@ function deriveGreeting() {
   if (hour < 12) return "Good morning";
   if (hour < 18) return "Good afternoon";
   return "Good evening";
-}
-
-function confidenceLabel(score?: number | null) {
-  if (typeof score !== "number") return "Evidence";
-  if (score >= 0.75) return "High confidence";
-  if (score >= 0.55) return "Medium confidence";
-  return "Low confidence";
 }
 
 export default function Home() {
@@ -385,10 +355,14 @@ export default function Home() {
 
   const [query, setQuery] = useState("");
   const [chat, setChat] = useState<ChatMessage[]>([]);
-  const [citations, setCitations] = useState<Citation[]>([]);
-  const [sourceMatches, setSourceMatches] = useState<RetrievalMatch[]>([]);
+  const [askSources, setAskSources] = useState<SourceEvidence[]>([]);
+  const [askFindings, setAskFindings] = useState<CitedText[]>([]);
+  const [askRecommendations, setAskRecommendations] = useState<CitedText[]>([]);
+  const [askAnswer, setAskAnswer] = useState<CitedText | null>(null);
   const [briefFromServer, setBriefFromServer] = useState<AskResp["brief"]>();
   const [answerMode, setAnswerMode] = useState<AskResp["answer_mode"] | null>(null);
+  const [evidenceNote, setEvidenceNote] = useState<string | null>(null);
+  const [selectedEvidence, setSelectedEvidence] = useState<SourceEvidence | null>(null);
   const [busy, setBusy] = useState<null | "upload" | "insights" | "ask">(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -492,24 +466,29 @@ export default function Home() {
   const selectedInsight = insightsById.get(selectedInsightId);
   const selectedTab = INSIGHT_TABS.find((tab) => tab.moduleId === selectedInsightId) ?? INSIGHT_TABS[0];
 
-  const selectedStructuredCitations = useMemo(() => {
-    return (selectedInsight?.citations ?? []).filter(isStructuredCitation) as StructuredCitation[];
-  }, [selectedInsight]);
+  const selectedSources = selectedInsight?.sources ?? [];
 
-  const citationOrder = useMemo(() => buildCitationOrder(citations), [citations]);
+  const openEvidence = useCallback((source: SourceEvidence) => {
+    setSelectedEvidence(source);
+  }, []);
 
-  const matchesBySource = useMemo(() => {
-    const lookup = new Map<string, RetrievalMatch>();
-    sourceMatches.forEach((match) => {
-      lookup.set(match.id, match);
-    });
-    return lookup;
-  }, [sourceMatches]);
-
-  const insightBrief = useMemo(
-    () => buildInsightBrief(latestAssistantMessage, latestQuestion, briefFromServer),
-    [latestAssistantMessage, latestQuestion, briefFromServer]
-  );
+  const insightBrief = useMemo(() => {
+    if (briefFromServer) {
+      return {
+        directAnswer: briefFromServer.direct_answer,
+        keyFindings: briefFromServer.key_findings,
+        recommendedActions: briefFromServer.recommended_next_actions,
+      };
+    }
+    if (askAnswer) {
+      return {
+        directAnswer: askAnswer.text,
+        keyFindings: askFindings.map((item) => item.text),
+        recommendedActions: askRecommendations.map((item) => item.text),
+      };
+    }
+    return buildInsightBrief(latestAssistantMessage, latestQuestion, briefFromServer);
+  }, [latestAssistantMessage, latestQuestion, briefFromServer, askAnswer, askFindings, askRecommendations]);
 
   async function fetchInsights(docId: string, clearOldInsights = false) {
     if (clearOldInsights) setInsights([]);
@@ -550,10 +529,14 @@ export default function Home() {
       setInsights([]);
       setQuery("");
       setChat([]);
-      setCitations([]);
-      setSourceMatches([]);
+      setAskSources([]);
+      setAskFindings([]);
+      setAskRecommendations([]);
+      setAskAnswer(null);
       setBriefFromServer(undefined);
       setAnswerMode(null);
+      setEvidenceNote(null);
+      setSelectedEvidence(null);
 
       setBusy(null);
       await fetchInsights(up.doc_id, true);
@@ -576,6 +559,11 @@ export default function Home() {
     setBusy("ask");
     setAnswerMode(null);
     setBriefFromServer(undefined);
+    setAskSources([]);
+    setAskFindings([]);
+    setAskRecommendations([]);
+    setAskAnswer(null);
+    setEvidenceNote(null);
     setChat((c) => [...c, { role: "user", text: trimmedQuery }]);
 
     try {
@@ -589,23 +577,38 @@ export default function Home() {
         const msg = resp.message || "Ask failed";
         setChat((c) => [...c, { role: "assistant", text: msg }]);
         recordApiResponseMeta(resp);
-        setCitations(resp.citations ?? []);
-        setSourceMatches(resp.matches ?? []);
+        setAskSources(resp.sources ?? []);
+        setAskFindings(resp.source_backed_findings ?? []);
+        setAskRecommendations(resp.advisor_recommendations ?? []);
+        setAskAnswer(typeof resp.answer === "object" ? resp.answer : { text: resp.answer ?? msg, citation_ids: [] });
         setBriefFromServer(resp.brief);
+        setEvidenceNote(resp.evidence_note ?? resp.brief?.evidence_note ?? null);
         setAnswerMode(resp.answer_mode ?? null);
         return;
       }
 
-      setChat((c) => [...c, { role: "assistant", text: resp.answer ?? "" }]);
+      const answerObj =
+        typeof resp.answer === "object"
+          ? resp.answer
+          : { text: resp.answer ?? "", citation_ids: [] as number[] };
+
+      setChat((c) => [...c, { role: "assistant", text: answerObj.text }]);
       recordApiResponseMeta(resp);
-      setCitations(resp.citations ?? []);
-      setSourceMatches(resp.matches ?? []);
+      setAskSources(resp.sources ?? []);
+      setAskFindings(resp.source_backed_findings ?? []);
+      setAskRecommendations(resp.advisor_recommendations ?? []);
+      setAskAnswer(answerObj);
       setBriefFromServer(resp.brief);
+      setEvidenceNote(resp.evidence_note ?? resp.brief?.evidence_note ?? null);
       setAnswerMode(resp.answer_mode ?? "rag");
     } catch (e: unknown) {
       setErr(asErrorMessage(e, "Ask failed"));
-      setSourceMatches([]);
+      setAskSources([]);
+      setAskFindings([]);
+      setAskRecommendations([]);
+      setAskAnswer(null);
       setBriefFromServer(undefined);
+      setEvidenceNote(null);
     } finally {
       setBusy(null);
     }
@@ -647,10 +650,14 @@ export default function Home() {
     setInsights([]);
     setQuery("");
     setChat([]);
-    setCitations([]);
-    setSourceMatches([]);
+    setAskSources([]);
+    setAskFindings([]);
+    setAskRecommendations([]);
+    setAskAnswer(null);
     setBriefFromServer(undefined);
     setAnswerMode(null);
+    setEvidenceNote(null);
+    setSelectedEvidence(null);
     setLastRequestId(null);
     setLastTenantId(null);
   }
@@ -663,10 +670,14 @@ export default function Home() {
     setActiveInsightId(INSIGHT_TABS[0].moduleId);
     setQuery("");
     setChat([]);
-    setCitations([]);
-    setSourceMatches([]);
+    setAskSources([]);
+    setAskFindings([]);
+    setAskRecommendations([]);
+    setAskAnswer(null);
     setBriefFromServer(undefined);
     setAnswerMode(null);
+    setEvidenceNote(null);
+    setSelectedEvidence(null);
     setErr(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
@@ -898,18 +909,28 @@ export default function Home() {
                   </div>
                   <h2>{selectedInsight.title}</h2>
                   <p>
-                    {citedTextStr(selectedInsight.direct_answer) || citedTextStr(selectedInsight.summary)}
-                    {citedTextIds(selectedInsight.direct_answer).length > 0 && (
-                      <span className="citation-pills">
-                        {citedTextIds(selectedInsight.direct_answer).map((id) => (
-                          <span key={id} className="citation-chip" title={`Source excerpt ${id}`}>{id}</span>
-                        ))}
-                      </span>
+                    {renderCitedContent(
+                      selectedInsight.direct_answer || selectedInsight.summary,
+                      selectedSources,
+                      openEvidence
                     )}
                   </p>
-                  {statusHintForInsight(selectedInsight.status) && (
-                    <p className="insight-note">{statusHintForInsight(selectedInsight.status)}</p>
+                  {statusHintForInsight(selectedInsight.status, selectedInsight.evidence_limitations) && (
+                    <p className="insight-note">
+                      {statusHintForInsight(selectedInsight.status, selectedInsight.evidence_limitations)}
+                    </p>
                   )}
+                  {selectedInsight.evidence_limitations?.has_limitations &&
+                    (selectedInsight.evidence_limitations.validation_questions?.length ?? 0) > 0 && (
+                      <div className="validation-questions">
+                        <h4>What to validate next</h4>
+                        <ul>
+                          {selectedInsight.evidence_limitations.validation_questions.map((question, index) => (
+                            <li key={index}>{question}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                 </div>
                 <div className="hero-visual" aria-hidden>
                   <span />
@@ -923,16 +944,7 @@ export default function Home() {
                   <h3>Key Findings</h3>
                   <ul>
                     {selectedInsight.key_findings.map((finding, index) => (
-                      <li key={index}>
-                        {citedTextStr(finding)}
-                        {citedTextIds(finding).length > 0 && (
-                          <span className="citation-pills">
-                            {citedTextIds(finding).map((id) => (
-                              <span key={id} className="citation-chip" title={`Source excerpt ${id}`}>{id}</span>
-                            ))}
-                          </span>
-                        )}
-                      </li>
+                      <li key={index}>{renderCitedContent(finding, selectedSources, openEvidence)}</li>
                     ))}
                   </ul>
                 </section>
@@ -941,7 +953,7 @@ export default function Home() {
                   <h3>Recommended Actions</h3>
                   <ul>
                     {selectedInsight.recommended_actions.map((action, index) => (
-                      <li key={index}>{citedTextStr(action)}</li>
+                      <li key={index}>{renderCitedContent(action, selectedSources, openEvidence)}</li>
                     ))}
                   </ul>
                 </section>
@@ -956,23 +968,24 @@ export default function Home() {
                       </button>
                     )}
                   </div>
-                  {selectedStructuredCitations.length === 0 ? (
+                  {selectedSources.length === 0 ? (
                     <p className="sources-empty">No source excerpts were available for this insight.</p>
                   ) : (
                     <div className="sources-list">
-                      {selectedStructuredCitations.map((sc) => (
-                        <details key={`${selectedInsight.module_id}-src-${sc.id}`} className="source-row">
+                      {selectedSources.map((source) => (
+                        <details key={`${selectedInsight.module_id}-src-${source.citation_id}`} className="source-row">
                           <summary>
-                            <span className="source-number">{sc.id}</span>
+                            <span className="source-number">{source.citation_id}</span>
                             <div>
-                              <p className="source-title">{sc.excerpt_label}</p>
-                              <p className="source-confidence">{sc.confidence === "high" ? "High confidence" : sc.confidence === "medium" ? "Medium confidence" : "Low confidence"}</p>
+                              <p className="source-title">Source {source.citation_id}</p>
+                              <p className="source-confidence">{source.document_name}</p>
                             </div>
                           </summary>
-                          {sc.excerpt && (
+                          {source.excerpt && (
                             <div className="source-evidence-drawer">
                               <p className="evidence-label">Source evidence — not AI-generated analysis</p>
-                              <p className="source-preview">{sc.excerpt}</p>
+                              {source.page && <p className="source-page">Page {source.page}</p>}
+                              <p className="source-preview">{source.excerpt}</p>
                             </div>
                           )}
                         </details>
@@ -982,12 +995,11 @@ export default function Home() {
                 </section>
               </div>
 
-              {selectedInsight.assumptions && selectedInsight.assumptions.length > 0 && (
-                <div className="assumptions-note">
-                  <h4>Assumptions</h4>
-                  <ul>
-                    {selectedInsight.assumptions.map((a, i) => <li key={i}>{a}</li>)}
-                  </ul>
+              {selectedInsight.evidence_limitations?.has_limitations && selectedSources.length > 0 && (
+                <div className="view-sources-row">
+                  <button type="button" className="ghost-btn" onClick={() => openEvidence(selectedSources[0])}>
+                    View source evidence
+                  </button>
                 </div>
               )}
             </>
@@ -1037,19 +1049,22 @@ export default function Home() {
                     )}
                   </div>
                   <p className="ask-direct-answer">
-                    {renderTextWithCitationChips(insightBrief.directAnswer, citationOrder)}
+                    {askAnswer
+                      ? renderCitedContent(askAnswer, askSources, openEvidence)
+                      : renderInlineMarkdown(insightBrief.directAnswer, "ask-answer")}
                   </p>
 
-                  {briefFromServer?.evidence_note && (
-                    <p className="evidence-note">{briefFromServer.evidence_note}</p>
-                  )}
+                  {evidenceNote && <p className="evidence-note">{evidenceNote}</p>}
 
                   <div className="ask-details-grid">
                     <section>
                       <h4>Source-backed Findings</h4>
                       <ul>
-                        {insightBrief.keyFindings.map((finding, index) => (
-                          <li key={index}>{renderTextWithCitationChips(finding, citationOrder)}</li>
+                        {(askFindings.length > 0
+                          ? askFindings
+                          : insightBrief.keyFindings.map((text) => ({ text, citation_ids: [] as number[] }))
+                        ).map((finding, index) => (
+                          <li key={index}>{renderCitedContent(finding, askSources, openEvidence)}</li>
                         ))}
                       </ul>
                     </section>
@@ -1057,8 +1072,11 @@ export default function Home() {
                     <section>
                       <h4>Advisor Recommendations</h4>
                       <ul>
-                        {insightBrief.recommendedActions.map((action, index) => (
-                          <li key={index}>{action}</li>
+                        {(askRecommendations.length > 0
+                          ? askRecommendations
+                          : insightBrief.recommendedActions.map((text) => ({ text, citation_ids: [] as number[] }))
+                        ).map((action, index) => (
+                          <li key={index}>{renderCitedContent(action, askSources, openEvidence)}</li>
                         ))}
                       </ul>
                     </section>
@@ -1068,29 +1086,47 @@ export default function Home() {
             </div>
           )}
 
-          {citations.length > 0 && (
+          {askSources.length > 0 && (
             <div className="ask-sources">
               <h3>Supporting Sources</h3>
               <div className="sources-list">
-                {citations.map((citation, index) => {
-                  const match = matchesBySource.get(citation.source_id);
-                  return (
-                    <details key={citation.source_id} className="source-row">
-                      <summary>
-                        <span className="source-number">{index + 1}</span>
-                        <div>
-                          <p className="source-title">Source excerpt {index + 1}</p>
-                          <p className="source-confidence">{confidenceLabel(citation.score)}</p>
-                        </div>
-                      </summary>
-                      {match?.text && <p className="source-preview">{match.text}</p>}
-                    </details>
-                  );
-                })}
+                {askSources.map((source) => (
+                  <details key={`ask-src-${source.citation_id}`} className="source-row">
+                    <summary>
+                      <span className="source-number">{source.citation_id}</span>
+                      <div>
+                        <p className="source-title">Source {source.citation_id}</p>
+                        <p className="source-confidence">{source.document_name}</p>
+                      </div>
+                    </summary>
+                    {source.excerpt && (
+                      <div className="source-evidence-drawer">
+                        {source.page && <p className="source-page">Page {source.page}</p>}
+                        <p className="source-preview">{source.excerpt}</p>
+                      </div>
+                    )}
+                  </details>
+                ))}
               </div>
             </div>
           )}
         </section>
+
+        {selectedEvidence && (
+          <div className="evidence-modal-backdrop" onClick={() => setSelectedEvidence(null)}>
+            <div className="evidence-modal" onClick={(event) => event.stopPropagation()}>
+              <div className="evidence-modal-head">
+                <h3>Source {selectedEvidence.citation_id}</h3>
+                <button type="button" className="ghost-btn" onClick={() => setSelectedEvidence(null)}>
+                  Close
+                </button>
+              </div>
+              <p className="source-confidence">{selectedEvidence.document_name}</p>
+              {selectedEvidence.page && <p className="source-page">Page {selectedEvidence.page}</p>}
+              <p className="source-preview">{selectedEvidence.excerpt}</p>
+            </div>
+          </div>
+        )}
 
         {docsOpen && (
           <section className="glass-card docs-panel" aria-label="Documents">
