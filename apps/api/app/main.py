@@ -15,6 +15,18 @@ from typing import Optional, Any
 from google.genai import errors as genai_errors
 
 from app import client_test_auth as client_auth
+from app.insight_contract import (
+    build_insight_generation_instruction,
+    build_insight_repair_instruction,
+    build_limited_evidence_module,
+    build_public_sources,
+    finalize_insight_module,
+    module_to_response_dict,
+    parse_cited_field,
+    strip_inline_citations_from_text,
+    text_has_internal_artifact,
+    text_is_generic_placeholder,
+)
 
 import json
 import time
@@ -37,7 +49,7 @@ def log_json(**fields):
 
 STORAGE_DIR = Path("/app/storage")
 SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv", "xlsx")
-INSIGHT_PIPELINE_VERSION = "source-packet-contract-v4"
+INSIGHT_PIPELINE_VERSION = "insight-output-contract-v5"
 
 def get_tenant_id(request: Request) -> str:
     """
@@ -2680,198 +2692,9 @@ def validate_module_response_contract(module: dict[str, Any]) -> tuple[bool, lis
     return (len(reasons) == 0, sorted(set(reasons)))
 
 
-def build_insight_module_instruction(module_title: str, retrieval_query: str) -> str:
-    return (
-        "You are generating an executive business brief from the numbered source packets below.\n"
-        "Return ONLY valid JSON with keys: summary, direct_answer, key_findings, recommended_actions.\n"
-        "Each text field must be clean executive prose with NO internal IDs and NO embedded citation strings.\n"
-        "Return citation IDs separately using this shape:\n"
-        '- direct_answer: {"text": "...", "citation_ids": [1, 2]}\n'
-        '- key_findings: [{"text": "...", "citation_ids": [1]}, ...]\n'
-        '- recommended_actions: [{"text": "...", "citation_ids": [1, 2]}, ...]\n'
-        "- summary may be a plain string or the same cited-object shape.\n\n"
-        "Rules:\n"
-        "- Use only citation markers [1], [2], [3] corresponding to the provided source packets.\n"
-        "- Never output document IDs, chunk IDs, UUIDs, metadata values, raw source labels, or database identifiers.\n"
-        "- Return citation IDs separately in structured JSON. Do not write citation strings inside prose.\n"
-        "- NEVER copy raw text fragments. Rewrite as clean executive prose.\n"
-        "- NEVER include broken sentences, table dumps, or repeated labels like 'Medium Medium'.\n"
-        "- Each item must be a complete, grammatically correct sentence.\n"
-        "- Provide 2-4 substantive findings and 2-4 concrete recommended actions.\n\n"
-        f"Module: {module_title}\n"
-        f"Diagnostic goal: {retrieval_query}\n"
-    )
-
-
-def build_limited_evidence_module(
-    module_id: str,
-    title: str,
-    source_packets: list[dict[str, Any]],
-    *,
-    partial_module: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    copy = get_module_fallback_copy(module_id, title)
-    sources = _build_public_sources(source_packets)
-    max_sources = max(len(sources), 1)
-    default_ids = [1] if sources else []
-    if len(sources) > 1:
-        default_ids.append(2)
-
-    def cited_from_copy(text: str, ids: list[int] | None = None) -> dict[str, Any]:
-        return _parse_cited_field(text, max_sources, ids or default_ids)
-
-    direct_answer = cited_from_copy(copy["direct_answer"], [])
-    key_findings = [cited_from_copy(item) for item in copy["key_findings"][:3]]
-    recommended_actions = [cited_from_copy(item) for item in copy["recommended_actions"][:3]]
-
-    if partial_module:
-        candidate_da = partial_module.get("direct_answer")
-        if isinstance(candidate_da, dict) and compact_whitespace(candidate_da.get("text", "")):
-            if not looks_like_raw_or_broken(candidate_da.get("text", "")):
-                direct_answer = candidate_da
-
-        partial_findings = [
-            item for item in (partial_module.get("key_findings") or [])
-            if isinstance(item, dict) and compact_whitespace(item.get("text", "")) and not looks_like_raw_or_broken(item.get("text", ""))
-        ]
-        if len(partial_findings) >= 2:
-            key_findings = partial_findings[:3]
-
-        partial_actions = [
-            item for item in (partial_module.get("recommended_actions") or [])
-            if isinstance(item, dict) and compact_whitespace(item.get("text", "")) and not looks_generic_or_low_value_action(item.get("text", ""))
-        ]
-        if len(partial_actions) >= 2:
-            recommended_actions = partial_actions[:3]
-
-    return {
-        "module_id": module_id,
-        "title": title,
-        "status": "limited_evidence",
-        "confidence": "low",
-        "summary": direct_answer,
-        "direct_answer": direct_answer,
-        "key_findings": key_findings,
-        "recommended_actions": recommended_actions,
-        "sources": sources,
-        "evidence_limitations": {
-            "has_limitations": True,
-            "message": _limited_evidence_message(),
-            "validation_questions": _module_validation_questions(module_id),
-        },
-    }
-
-
-def finalize_executive_module(
-    module_id: str,
-    title: str,
-    generated_module: dict[str, Any] | None,
-    source_packets: list[dict[str, Any]],
-    request_id: str,
-    tenant_id: str,
-    doc_id: str,
-) -> dict[str, Any]:
-    sources = _build_public_sources(source_packets)
-    max_sources = len(sources)
-    default_ids = [sources[0]["citation_id"]] if sources else []
-
-    if generated_module is None or not sources:
-        return build_limited_evidence_module(module_id, title, source_packets)
-
-    summary = _parse_cited_field(generated_module.get("summary"), max_sources, default_ids)
-    direct_answer = _parse_cited_field(generated_module.get("direct_answer"), max_sources, default_ids)
-    if not compact_whitespace(direct_answer["text"]):
-        direct_answer = summary
-
-    findings_raw = generated_module.get("key_findings") or []
-    actions_raw = generated_module.get("recommended_actions") or []
-
-    key_findings = [_parse_cited_field(item, max_sources) for item in findings_raw if item]
-    recommended_actions = [_parse_cited_field(item, max_sources) for item in actions_raw if item]
-
-    key_findings = [
-        item for item in key_findings
-        if compact_whitespace(item.get("text", "")) and not looks_like_raw_or_broken(item.get("text", ""))
-    ]
-    recommended_actions = [
-        item for item in recommended_actions
-        if compact_whitespace(item.get("text", "")) and not looks_generic_or_low_value_action(item.get("text", ""))
-    ]
-
-    status = "ready"
-    confidence = "high" if max_sources >= 2 else "medium"
-    evidence_limitations = {
-        "has_limitations": False,
-        "message": None,
-        "validation_questions": [],
-    }
-
-    partial_module = {
-        "direct_answer": direct_answer,
-        "key_findings": key_findings,
-        "recommended_actions": recommended_actions,
-    }
-
-    if (
-        looks_like_raw_or_broken(direct_answer.get("text", ""))
-        or len(key_findings) < 2
-        or len(recommended_actions) < 2
-    ):
-        limited = build_limited_evidence_module(
-            module_id,
-            title,
-            source_packets,
-            partial_module=partial_module,
-        )
-        log_json(
-            level="INFO",
-            event="insight_module_quality_gate_applied",
-            service="api",
-            request_id=request_id,
-            tenant_id=tenant_id,
-            doc_id_filter=doc_id,
-            module_id=module_id,
-            module_title=title,
-            fallback_reason="limited_evidence_gate",
-            confidence="low",
-        )
-        return limited
-
-    module_payload = {
-        "module_id": module_id,
-        "title": title,
-        "status": status,
-        "confidence": confidence,
-        "summary": summary if compact_whitespace(summary.get("text", "")) else direct_answer,
-        "direct_answer": direct_answer,
-        "key_findings": key_findings[:4],
-        "recommended_actions": recommended_actions[:4],
-        "sources": sources,
-        "evidence_limitations": evidence_limitations,
-    }
-
-    contract_ok, contract_reasons = validate_module_response_contract(module_payload)
-    if not contract_ok:
-        limited = build_limited_evidence_module(
-            module_id,
-            title,
-            source_packets,
-            partial_module=partial_module,
-        )
-        log_json(
-            level="INFO",
-            event="insight_module_contract_failed",
-            service="api",
-            request_id=request_id,
-            tenant_id=tenant_id,
-            doc_id_filter=doc_id,
-            module_id=module_id,
-            module_title=title,
-            contract_reasons=contract_reasons,
-        )
-        return limited
-
-    return module_payload
+# Legacy insight finalizers below (finalize_visible_insight_response, build_clean_grounded_module,
+# finalize_insight_module) are isolated from the /v1/insights hot path. The active contract lives
+# in app.insight_contract.finalize_insight_module.
 
 
 @app.post("/v1/insights")
@@ -2922,7 +2745,15 @@ def generate_insights(req: InsightsRequest, request: Request):
                 detail=str(error)[:500],
             )
             client_modules.append(
-                build_limited_evidence_module(module_id, module_title, [])
+                module_to_response_dict(
+                    build_limited_evidence_module(
+                        module_key=normalize_module_key(module_id, module_title),
+                        module_id=module_id,
+                        title=module_title,
+                        sources=[],
+                        fallback_copy=get_module_fallback_copy(module_id, module_title),
+                    )
+                )
             )
             modules_using_fallback.append(module_id)
             if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
@@ -2937,7 +2768,15 @@ def generate_insights(req: InsightsRequest, request: Request):
 
         if not source_packets:
             client_modules.append(
-                build_limited_evidence_module(module_id, module_title, [])
+                module_to_response_dict(
+                    build_limited_evidence_module(
+                        module_key=normalize_module_key(module_id, module_title),
+                        module_id=module_id,
+                        title=module_title,
+                        sources=[],
+                        fallback_copy=get_module_fallback_copy(module_id, module_title),
+                    )
+                )
             )
             modules_using_fallback.append(module_id)
             success_count += 1
@@ -2952,7 +2791,7 @@ def generate_insights(req: InsightsRequest, request: Request):
             document_name=document_name,
         )
         context_block = "\n\n---\n\n".join(snippets)
-        module_instruction = build_insight_module_instruction(module_title, retrieval_query)
+        module_instruction = build_insight_generation_instruction(module_title, retrieval_query)
         full_prompt = (
             f"{module_instruction}\n"
             f"Source packets:\n{context_block}\n\n"
@@ -2960,6 +2799,8 @@ def generate_insights(req: InsightsRequest, request: Request):
         )
 
         generated_module: dict[str, Any] | None = None
+        module_key = normalize_module_key(module_id, module_title)
+        fallback_copy = get_module_fallback_copy(module_id, module_title)
         try:
             resp = generate_content_with_retry(
                 gemini=gemini,
@@ -3005,19 +2846,73 @@ def generate_insights(req: InsightsRequest, request: Request):
                 detail=str(error)[:500],
             )
 
-        finalized = finalize_executive_module(
-            module_id,
-            module_title,
-            generated_module,
-            source_packets,
-            request_id,
-            tenant_id,
-            doc_id,
+        module_output, failure_reasons = finalize_insight_module(
+            module_key=module_key,
+            module_id=module_id,
+            title=module_title,
+            generated=generated_module,
+            source_packets=source_packets,
+            fallback_copy=fallback_copy,
         )
+
+        if failure_reasons and generated_module is not None:
+            repair_prompt = (
+                f"{build_insight_repair_instruction(module_title, retrieval_query, failure_reasons)}\n"
+                f"Source packets:\n{context_block}\n\n"
+                "Generate the corrected JSON response now."
+            )
+            try:
+                repair_resp = generate_content_with_retry(
+                    gemini=gemini,
+                    model_name=model_name,
+                    full_prompt=repair_prompt,
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    retrieved_k=len(matches),
+                    max_attempts=2,
+                    base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
+                )
+                repair_text = getattr(repair_resp, "text", None)
+                if repair_text is None and isinstance(repair_resp, dict):
+                    repair_text = repair_resp.get("text")
+                repaired_obj = parse_model_json(repair_text or "")
+                if repaired_obj is not None:
+                    module_output, failure_reasons = finalize_insight_module(
+                        module_key=module_key,
+                        module_id=module_id,
+                        title=module_title,
+                        generated=repaired_obj,
+                        source_packets=source_packets,
+                        fallback_copy=fallback_copy,
+                    )
+                    log_json(
+                        level="INFO",
+                        event="insight_module_repair_attempted",
+                        service="api",
+                        request_id=request_id,
+                        tenant_id=tenant_id,
+                        doc_id=doc_id,
+                        module_id=module_id,
+                        repair_succeeded=module_output.status == "ready",
+                        failure_reasons=failure_reasons,
+                    )
+            except Exception as repair_error:
+                log_json(
+                    level="WARNING",
+                    event="insight_module_repair_failed",
+                    service="api",
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    doc_id=doc_id,
+                    module_id=module_id,
+                    error=type(repair_error).__name__,
+                    detail=str(repair_error)[:300],
+                )
+
+        finalized = module_to_response_dict(module_output)
         if finalized.get("status") == "limited_evidence":
             modules_using_fallback.append(module_id)
-        contract_ok, _ = validate_module_response_contract(finalized)
-        if not contract_ok:
+        if failure_reasons:
             modules_contract_failed.append(module_id)
 
         client_modules.append(finalized)
@@ -3068,10 +2963,17 @@ def generate_insights(req: InsightsRequest, request: Request):
                 continue
             if visible_module_uuid_locations(module):
                 repaired_modules.append(
-                    build_limited_evidence_module(
-                        module.get("module_id", ""),
-                        module.get("title", ""),
-                        [],
+                    module_to_response_dict(
+                        build_limited_evidence_module(
+                            module_key=normalize_module_key(module.get("module_id", ""), module.get("title", "")),
+                            module_id=module.get("module_id", ""),
+                            title=module.get("title", ""),
+                            sources=[],
+                            fallback_copy=get_module_fallback_copy(
+                                module.get("module_id", ""),
+                                module.get("title", ""),
+                            ),
+                        )
                     )
                 )
                 modules_contract_failed.append(module.get("module_id", ""))
@@ -3123,32 +3025,27 @@ def finalize_ask_response(
     source_packets: list[dict[str, Any]],
     brief_obj: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    sources = _build_public_sources(source_packets)
+    sources = build_public_sources(source_packets)
     max_sources = len(sources)
+    default_ids = [sources[0].citation_id] if sources else []
 
     if brief_obj is not None:
-        answer_cited = _parse_cited_field(brief_obj.get("direct_answer", answer_text), max_sources, [1] if sources else [])
-        findings = [
-            _parse_cited_field(item, max_sources)
-            for item in (brief_obj.get("key_findings") or [])
-        ]
-        advisor_actions = [
-            _parse_cited_field(item, max_sources, [])
-            for item in (brief_obj.get("recommended_next_actions") or [])
-        ]
+        answer_cited = parse_cited_field(brief_obj.get("direct_answer", answer_text), max_sources=max_sources, fallback_ids=default_ids)
+        findings = [parse_cited_field(item, max_sources=max_sources) for item in (brief_obj.get("key_findings") or [])]
+        advisor_actions = [parse_cited_field(item, max_sources=max_sources, fallback_ids=[]) for item in (brief_obj.get("recommended_next_actions") or [])]
         confidence = brief_obj.get("confidence")
         evidence_note = brief_obj.get("evidence_note")
     else:
         if parsed_brief is None:
             parsed_brief = build_answer_brief(query_text, answer_text, [])
-        answer_cited = _parse_cited_field(parsed_brief.direct_answer, max_sources, [1] if sources else [])
+        answer_cited = parse_cited_field(parsed_brief.direct_answer, max_sources=max_sources, fallback_ids=default_ids)
         findings = [
-            _parse_cited_field(item, max_sources)
+            parse_cited_field(item, max_sources=max_sources)
             for item in (parsed_brief.key_findings or [])
             if isinstance(item, str) and compact_whitespace(item)
         ]
         advisor_actions = [
-            _parse_cited_field(item, max_sources, [])
+            parse_cited_field(item, max_sources=max_sources, fallback_ids=[])
             for item in (parsed_brief.recommended_next_actions or [])
             if isinstance(item, str) and compact_whitespace(item)
         ]
@@ -3157,21 +3054,21 @@ def finalize_ask_response(
 
     findings = [
         item for item in findings
-        if compact_whitespace(item.get("text", "")) and not looks_like_raw_or_broken(item.get("text", ""))
+        if compact_whitespace(item.text) and not text_has_internal_artifact(item.text)
     ][:4]
 
     advisor_actions = [
         item for item in advisor_actions
-        if compact_whitespace(item.get("text", "")) and not looks_generic_or_low_value_action(item.get("text", ""))
+        if compact_whitespace(item.text) and not text_is_generic_placeholder(item.text)
     ][:4]
 
     return {
-        "answer": answer_cited,
-        "source_backed_findings": findings,
-        "advisor_recommendations": advisor_actions,
-        "sources": sources,
+        "answer": answer_cited.model_dump(),
+        "source_backed_findings": [item.model_dump() for item in findings],
+        "advisor_recommendations": [item.model_dump() for item in advisor_actions],
+        "sources": [item.model_dump() for item in sources],
         "confidence": confidence,
-        "evidence_note": strip_source_artifacts(evidence_note or "") if isinstance(evidence_note, str) else "",
+        "evidence_note": strip_inline_citations_from_text(evidence_note or "") if isinstance(evidence_note, str) else "",
     }
 
 

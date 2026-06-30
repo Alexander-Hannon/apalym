@@ -7,14 +7,16 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.main import (  # noqa: E402
-    _build_public_sources,
-    _contains_raw_visible_artifact,
-    _parse_cited_field,
     build_clean_source_packets,
-    build_limited_evidence_module,
     clean_source_excerpt,
     strip_source_artifacts,
     validate_module_response_contract,
+    _parse_cited_field,
+)
+from app.insight_contract import (  # noqa: E402
+    build_limited_evidence_module,
+    build_public_sources,
+    text_has_internal_artifact,
 )
 
 UUID_PATTERN = re.compile(
@@ -81,11 +83,12 @@ class CitationContractTests(unittest.TestCase):
             ],
             document_name="meridian_cold_chain_financial_package.pdf",
         )
-        sources = _build_public_sources(packets)
+        sources = build_public_sources(packets)
         self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0]["document_name"], "meridian_cold_chain_financial_package.pdf")
-        self.assertNotIn("source_id", sources[0])
-        self.assertNotIn("uuid-123", json.dumps(sources))
+        self.assertEqual(sources[0].document_name, "meridian_cold_chain_financial_package.pdf")
+        dumped = json.dumps([source.model_dump() for source in sources])
+        self.assertNotIn("source_id", dumped)
+        self.assertNotIn("uuid-123", dumped)
 
     def test_validate_module_contract_accepts_ready_module(self):
         module = {
@@ -166,13 +169,35 @@ class CitationContractTests(unittest.TestCase):
             ],
             document_name="meridian_cold_chain_financial_package.pdf",
         )
-        module = build_limited_evidence_module("loss-leakage", "Where are we losing money?", packets)
-        self.assertEqual(module["status"], "limited_evidence")
-        self.assertTrue(module["evidence_limitations"]["has_limitations"])
-        self.assertGreaterEqual(len(module["evidence_limitations"]["validation_questions"]), 2)
-        visible = collect_visible_strings(module)
+        module = build_limited_evidence_module(
+            module_key="losses",
+            module_id="loss-leakage",
+            title="Where are we losing money?",
+            sources=build_public_sources(packets),
+            fallback_copy={
+                "direct_answer": "The document does not provide enough clean detail to make a definitive loss diagnosis.",
+                "key_findings": [
+                    "Warehouse overtime appears above target.",
+                    "Truck utilization appears below target.",
+                ],
+                "recommended_actions": [
+                    "Validate overtime by location, shift, and supervisor.",
+                    "Compare truck utilization by lane and customer.",
+                ],
+            },
+        )
+        self.assertEqual(module.status, "limited_evidence")
+        self.assertGreaterEqual(len(module.evidence_limitations.validation_questions), 2)
+        visible = [
+            module.direct_answer.text,
+            *[item.text for item in module.key_findings],
+            *[item.text for item in module.recommended_actions],
+            module.evidence_limitations.message or "",
+            *module.evidence_limitations.validation_questions,
+            *[source.excerpt for source in module.sources],
+        ]
         for text in visible:
-            self.assertFalse(_contains_raw_visible_artifact(text), text)
+            self.assertFalse(text_has_internal_artifact(text), text)
             self.assertFalse(any(filler.lower() in text.lower() for filler in GENERIC_FILLER), text)
 
 
