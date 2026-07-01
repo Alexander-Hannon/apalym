@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone
 import csv
 import re
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File
@@ -17,7 +17,6 @@ from google.genai import errors as genai_errors
 from app import client_test_auth as client_auth
 from app.insight_contract import (
     build_insight_generation_instruction,
-    build_insight_repair_instruction,
     build_limited_evidence_module,
     build_public_sources,
     finalize_insight_module as finalize_insight_module_contract,
@@ -50,7 +49,7 @@ def log_json(**fields):
 
 STORAGE_DIR = Path("/app/storage")
 SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv", "xlsx")
-INSIGHT_PIPELINE_VERSION = "insight-output-contract-v5"
+INSIGHT_PIPELINE_VERSION = "pilot-deadline-contract-v1"
 
 def get_tenant_id(request: Request) -> str:
     """
@@ -406,7 +405,9 @@ ASK_RETRY_BASE_BACKOFF_SECONDS = 0.75
 INSIGHT_TOP_K_CAP = 3
 INSIGHT_MAX_CHUNK_CHARS = 480
 INSIGHT_MAX_CONTEXT_CHARS = 1500
-INSIGHT_MAX_GENERATION_ATTEMPTS = 5
+INSIGHT_REQUEST_DEADLINE_SECONDS = int(os.getenv("INSIGHT_REQUEST_DEADLINE_SECONDS", "75"))
+INSIGHT_MODULE_MIN_REMAINING_SECONDS = int(os.getenv("INSIGHT_MODULE_MIN_REMAINING_SECONDS", "12"))
+INSIGHT_MAX_GENERATION_ATTEMPTS = int(os.getenv("INSIGHT_MAX_GENERATION_ATTEMPTS", "1"))
 INSIGHT_RETRY_BASE_BACKOFF_SECONDS = 1.0
 INSIGHT_MODULE_PAUSE_SECONDS = 0.35
 
@@ -2696,11 +2697,39 @@ def validate_module_response_contract(module: dict[str, Any]) -> tuple[bool, lis
 # in app.insight_contract.finalize_insight_module.
 
 
+def _insight_remaining_seconds(deadline_at: float) -> float:
+    return deadline_at - time.monotonic()
+
+
+def _insight_deadline_exceeded(deadline_at: float) -> bool:
+    return _insight_remaining_seconds(deadline_at) <= 0
+
+
+def _serialized_limited_evidence_module(
+    *,
+    module_key: str,
+    module_id: str,
+    title: str,
+    source_packets: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    sources = build_public_sources(source_packets or [])
+    return serialize_module_for_api(
+        build_limited_evidence_module(
+            module_key=module_key,
+            module_id=module_id,
+            title=title,
+            sources=sources,
+        )
+    )
+
+
 @app.post("/v1/insights")
 def generate_insights(req: InsightsRequest, request: Request):
     request_id = request.state.request_id
     tenant_id = get_tenant_id(request)
     doc_id = req.doc_id.strip()
+    started_at = time.monotonic()
+    deadline_at = started_at + INSIGHT_REQUEST_DEADLINE_SECONDS
 
     if not doc_id:
         raise HTTPException(status_code=400, detail="doc_id is required")
@@ -2723,6 +2752,30 @@ def generate_insights(req: InsightsRequest, request: Request):
         module_id = module_def["module_id"]
         module_title = module_def["title"]
         retrieval_query = module_def["retrieval_query"]
+        module_key = normalize_module_key(module_id, module_title)
+        remaining_seconds = _insight_remaining_seconds(deadline_at)
+
+        if _insight_deadline_exceeded(deadline_at):
+            log_json(
+                level="WARNING",
+                event="insight_module_skipped_deadline",
+                service="api",
+                pipeline_version=INSIGHT_PIPELINE_VERSION,
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                remaining_seconds=round(remaining_seconds, 3),
+            )
+            client_modules.append(
+                _serialized_limited_evidence_module(
+                    module_key=module_key,
+                    module_id=module_id,
+                    title=module_title,
+                )
+            )
+            modules_using_fallback.append(module_id)
+            continue
 
         try:
             matches = retrieve_matches(
@@ -2744,21 +2797,16 @@ def generate_insights(req: InsightsRequest, request: Request):
                 detail=str(error)[:500],
             )
             client_modules.append(
-                serialize_module_for_api(
-                    build_limited_evidence_module(
-                        module_key=normalize_module_key(module_id, module_title),
-                        module_id=module_id,
-                        title=module_title,
-                        sources=[],
-                    )
+                _serialized_limited_evidence_module(
+                    module_key=module_key,
+                    module_id=module_id,
+                    title=module_title,
                 )
             )
             modules_using_fallback.append(module_id)
-            if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
-                time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
             continue
 
-        source_packets, context_block = build_clean_source_packets(
+        source_packets, _context_block = build_clean_source_packets(
             matches,
             max_sources=min(len(matches), 3),
             document_name=document_name,
@@ -2766,19 +2814,39 @@ def generate_insights(req: InsightsRequest, request: Request):
 
         if not source_packets:
             client_modules.append(
-                serialize_module_for_api(
-                    build_limited_evidence_module(
-                        module_key=normalize_module_key(module_id, module_title),
-                        module_id=module_id,
-                        title=module_title,
-                        sources=[],
-                    )
+                _serialized_limited_evidence_module(
+                    module_key=module_key,
+                    module_id=module_id,
+                    title=module_title,
                 )
             )
             modules_using_fallback.append(module_id)
             success_count += 1
-            if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
-                time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
+            continue
+
+        remaining_seconds = _insight_remaining_seconds(deadline_at)
+        if remaining_seconds < INSIGHT_MODULE_MIN_REMAINING_SECONDS:
+            log_json(
+                level="WARNING",
+                event="insight_module_skipped_deadline",
+                service="api",
+                pipeline_version=INSIGHT_PIPELINE_VERSION,
+                request_id=request_id,
+                tenant_id=tenant_id,
+                doc_id=doc_id,
+                module_id=module_id,
+                remaining_seconds=round(remaining_seconds, 3),
+            )
+            client_modules.append(
+                _serialized_limited_evidence_module(
+                    module_key=module_key,
+                    module_id=module_id,
+                    title=module_title,
+                    source_packets=source_packets,
+                )
+            )
+            modules_using_fallback.append(module_id)
+            success_count += 1
             continue
 
         snippets, context_chars = build_context_snippets(
@@ -2796,7 +2864,6 @@ def generate_insights(req: InsightsRequest, request: Request):
         )
 
         generated_module: dict[str, Any] | None = None
-        module_key = normalize_module_key(module_id, module_title)
         try:
             resp = generate_content_with_retry(
                 gemini=gemini,
@@ -2808,13 +2875,26 @@ def generate_insights(req: InsightsRequest, request: Request):
                 max_attempts=INSIGHT_MAX_GENERATION_ATTEMPTS,
                 base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
             )
-            raw_text = getattr(resp, "text", None)
-            if raw_text is None and isinstance(resp, dict):
-                raw_text = resp.get("text")
+            if _insight_deadline_exceeded(deadline_at):
+                log_json(
+                    level="WARNING",
+                    event="insight_module_generation_discarded_deadline",
+                    service="api",
+                    pipeline_version=INSIGHT_PIPELINE_VERSION,
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    doc_id=doc_id,
+                    module_id=module_id,
+                    remaining_seconds=round(_insight_remaining_seconds(deadline_at), 3),
+                )
+            else:
+                raw_text = getattr(resp, "text", None)
+                if raw_text is None and isinstance(resp, dict):
+                    raw_text = resp.get("text")
 
-            parsed_obj = parse_model_json(raw_text or "")
-            if parsed_obj is not None:
-                generated_module = parsed_obj
+                parsed_obj = parse_model_json(raw_text or "")
+                if parsed_obj is not None:
+                    generated_module = parsed_obj
 
             log_json(
                 level="INFO",
@@ -2842,6 +2922,19 @@ def generate_insights(req: InsightsRequest, request: Request):
                 detail=str(error)[:500],
             )
 
+        if _insight_deadline_exceeded(deadline_at):
+            client_modules.append(
+                _serialized_limited_evidence_module(
+                    module_key=module_key,
+                    module_id=module_id,
+                    title=module_title,
+                    source_packets=source_packets,
+                )
+            )
+            modules_using_fallback.append(module_id)
+            success_count += 1
+            continue
+
         module_output, failure_reasons = finalize_insight_module_contract(
             module_key=module_key,
             module_id=module_id,
@@ -2849,59 +2942,6 @@ def generate_insights(req: InsightsRequest, request: Request):
             generated=generated_module,
             source_packets=source_packets,
         )
-
-        if failure_reasons and generated_module is not None:
-            repair_prompt = (
-                f"{build_insight_repair_instruction(module_title, retrieval_query, failure_reasons)}\n"
-                f"Source packets:\n{context_block}\n\n"
-                "Generate the corrected JSON response now."
-            )
-            try:
-                repair_resp = generate_content_with_retry(
-                    gemini=gemini,
-                    model_name=model_name,
-                    full_prompt=repair_prompt,
-                    request_id=request_id,
-                    tenant_id=tenant_id,
-                    retrieved_k=len(matches),
-                    max_attempts=2,
-                    base_backoff_seconds=INSIGHT_RETRY_BASE_BACKOFF_SECONDS,
-                )
-                repair_text = getattr(repair_resp, "text", None)
-                if repair_text is None and isinstance(repair_resp, dict):
-                    repair_text = repair_resp.get("text")
-                repaired_obj = parse_model_json(repair_text or "")
-                if repaired_obj is not None:
-                    module_output, failure_reasons = finalize_insight_module_contract(
-                        module_key=module_key,
-                        module_id=module_id,
-                        title=module_title,
-                        generated=repaired_obj,
-                        source_packets=source_packets,
-                    )
-                    log_json(
-                        level="INFO",
-                        event="insight_module_repair_attempted",
-                        service="api",
-                        request_id=request_id,
-                        tenant_id=tenant_id,
-                        doc_id=doc_id,
-                        module_id=module_id,
-                        repair_succeeded=module_output.status == "ready",
-                        failure_reasons=failure_reasons,
-                    )
-            except Exception as repair_error:
-                log_json(
-                    level="WARNING",
-                    event="insight_module_repair_failed",
-                    service="api",
-                    request_id=request_id,
-                    tenant_id=tenant_id,
-                    doc_id=doc_id,
-                    module_id=module_id,
-                    error=type(repair_error).__name__,
-                    detail=str(repair_error)[:300],
-                )
 
         finalized = serialize_module_for_api(module_output)
         if finalized.get("status") == "limited_evidence":
@@ -2912,7 +2952,10 @@ def generate_insights(req: InsightsRequest, request: Request):
         client_modules.append(finalized)
         success_count += 1
 
-        if mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1:
+        if (
+            mod_index < len(INSIGHT_MODULE_DEFINITIONS) - 1
+            and _insight_remaining_seconds(deadline_at) > INSIGHT_MODULE_MIN_REMAINING_SECONDS
+        ):
             time.sleep(INSIGHT_MODULE_PAUSE_SECONDS)
 
     log_json(
@@ -2927,6 +2970,7 @@ def generate_insights(req: InsightsRequest, request: Request):
         llm_model=model_name,
     )
 
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
     response_payload = {
         "ok": True,
         "service": "api",
@@ -2935,6 +2979,8 @@ def generate_insights(req: InsightsRequest, request: Request):
         "doc_id": doc_id,
         "module_count": len(client_modules),
         "successful_modules": success_count,
+        "pipeline_version": INSIGHT_PIPELINE_VERSION,
+        "elapsed_ms": elapsed_ms,
         "modules": client_modules,
     }
 
@@ -2957,13 +3003,10 @@ def generate_insights(req: InsightsRequest, request: Request):
                 continue
             if visible_module_uuid_locations(module):
                 repaired_modules.append(
-                    serialize_module_for_api(
-                        build_limited_evidence_module(
-                            module_key=normalize_module_key(module.get("module_id", ""), module.get("title", "")),
-                            module_id=module.get("module_id", ""),
-                            title=module.get("title", ""),
-                            sources=[],
-                        )
+                    _serialized_limited_evidence_module(
+                        module_key=normalize_module_key(module.get("module_id", ""), module.get("title", "")),
+                        module_id=module.get("module_id", ""),
+                        title=module.get("title", ""),
                     )
                 )
                 modules_contract_failed.append(module.get("module_id", ""))
@@ -2999,13 +3042,20 @@ def generate_insights(req: InsightsRequest, request: Request):
         tenant_id=tenant_id,
         doc_id_filter=doc_id,
         module_count=len(response_payload["modules"]),
+        elapsed_ms=elapsed_ms,
         has_raw_uuid_visible=bool(raw_uuid_locations),
         raw_uuid_locations=raw_uuid_locations,
         modules_using_fallback=sorted(set(modules_using_fallback)),
         modules_contract_failed=sorted(set(modules_contract_failed)),
     )
 
-    return response_payload
+    return JSONResponse(
+        content=response_payload,
+        headers={
+            "x-apalym-insight-pipeline": INSIGHT_PIPELINE_VERSION,
+            "x-apalym-insight-elapsed-ms": str(elapsed_ms),
+        },
+    )
 
 
 def finalize_ask_response(
