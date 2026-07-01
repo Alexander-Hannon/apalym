@@ -49,7 +49,7 @@ def log_json(**fields):
 
 STORAGE_DIR = Path("/app/storage")
 SUPPORTED_DOC_EXTENSIONS = ("pdf", "csv", "xlsx")
-INSIGHT_PIPELINE_VERSION = "pilot-deadline-contract-v1"
+INSIGHT_PIPELINE_VERSION = "pilot-evidence-contract-v1"
 
 def get_tenant_id(request: Request) -> str:
     """
@@ -1046,6 +1046,73 @@ def build_clean_source_packets(
         context_blocks.append(format_source_packet_block(packet))
 
     return source_packets, "\n\n".join(context_blocks)
+
+
+def build_insight_prompt_context(
+    source_packets: list[dict[str, Any]],
+    *,
+    max_packet_chars: int = INSIGHT_MAX_CHUNK_CHARS,
+    max_total_chars: int = INSIGHT_MAX_CONTEXT_CHARS,
+) -> tuple[str, int]:
+    """Build LLM prompt context from cleaned source packets only (never raw matches)."""
+    blocks: list[str] = []
+    total_chars = 0
+
+    for packet in source_packets:
+        trimmed_packet = {
+            **packet,
+            "excerpt": trim_snippet_text(packet.get("excerpt", ""), max_packet_chars),
+        }
+        block = format_source_packet_block(trimmed_packet)
+        block_len = len(block)
+        if blocks and total_chars + block_len > max_total_chars:
+            break
+        if not blocks and block_len > max_total_chars:
+            block = block[: max_total_chars - 1].rstrip() + "…"
+            block_len = len(block)
+        blocks.append(block)
+        total_chars += block_len
+        if total_chars >= max_total_chars:
+            break
+
+    return "\n\n".join(blocks), total_chars
+
+
+def _source_packets_from_module_sources(module: dict[str, Any]) -> list[dict[str, Any]]:
+    packets: list[dict[str, Any]] = []
+    for source in module.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        citation_id = source.get("citation_id")
+        if not isinstance(citation_id, int):
+            continue
+        packets.append(
+            {
+                "citation_id": citation_id,
+                "source_number": citation_id,
+                "label": f"[{citation_id}]",
+                "title": source.get("title") or "Source evidence",
+                "document_name": source.get("document_name") or "Uploaded document",
+                "page": source.get("page"),
+                "excerpt": source.get("excerpt") or "",
+            }
+        )
+    return packets
+
+
+def _resolved_module_source_packets(
+    module_id: str,
+    source_packets_by_module_id: dict[str, list[dict[str, Any]]],
+    module: dict[str, Any] | None = None,
+) -> list[dict[str, Any]] | None:
+    stored = source_packets_by_module_id.get(module_id) or []
+    if stored:
+        return stored
+    if module is not None:
+        reconstructed = _source_packets_from_module_sources(module)
+        if reconstructed:
+            return reconstructed
+    return None
 
 
 def _has_generic_placeholder(text: str) -> bool:
@@ -2747,6 +2814,7 @@ def generate_insights(req: InsightsRequest, request: Request):
     success_count = 0
     modules_using_fallback: list[str] = []
     modules_contract_failed: list[str] = []
+    source_packets_by_module_id: dict[str, list[dict[str, Any]]] = {}
 
     for mod_index, module_def in enumerate(INSIGHT_MODULE_DEFINITIONS):
         module_id = module_def["module_id"]
@@ -2772,6 +2840,9 @@ def generate_insights(req: InsightsRequest, request: Request):
                     module_key=module_key,
                     module_id=module_id,
                     title=module_title,
+                    source_packets=_resolved_module_source_packets(
+                        module_id, source_packets_by_module_id
+                    ),
                 )
             )
             modules_using_fallback.append(module_id)
@@ -2811,6 +2882,7 @@ def generate_insights(req: InsightsRequest, request: Request):
             max_sources=min(len(matches), 3),
             document_name=document_name,
         )
+        source_packets_by_module_id[module_id] = source_packets
 
         if not source_packets:
             client_modules.append(
@@ -2849,13 +2921,7 @@ def generate_insights(req: InsightsRequest, request: Request):
             success_count += 1
             continue
 
-        snippets, context_chars = build_context_snippets(
-            matches,
-            max_chunk_chars=INSIGHT_MAX_CHUNK_CHARS,
-            max_total_chars=INSIGHT_MAX_CONTEXT_CHARS,
-            document_name=document_name,
-        )
-        context_block = "\n\n".join(snippets)
+        context_block, context_chars = build_insight_prompt_context(source_packets)
         module_instruction = build_insight_generation_instruction(module_title, retrieval_query)
         full_prompt = (
             f"{module_instruction}\n"
@@ -3007,6 +3073,11 @@ def generate_insights(req: InsightsRequest, request: Request):
                         module_key=normalize_module_key(module.get("module_id", ""), module.get("title", "")),
                         module_id=module.get("module_id", ""),
                         title=module.get("title", ""),
+                        source_packets=_resolved_module_source_packets(
+                            module.get("module_id", ""),
+                            source_packets_by_module_id,
+                            module,
+                        ),
                     )
                 )
                 modules_contract_failed.append(module.get("module_id", ""))

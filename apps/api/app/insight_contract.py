@@ -390,6 +390,47 @@ LIMITED_EVIDENCE_COPY: dict[str, dict[str, Any]] = {
 }
 
 
+def trim_visible_text(text: str, max_chars: int = 220) -> str:
+    compact = compact_whitespace(text)
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 1].rstrip() + "…"
+
+
+def normalize_cited_field_for_api(field: CitedField) -> CitedField:
+    cleaned = strip_inline_citations_from_text(field.text)
+    if text_has_internal_artifact(cleaned):
+        cleaned = ""
+    return CitedField(text=cleaned, citation_ids=field.citation_ids)
+
+
+def build_source_supported_findings(
+    sources: list[SourceEvidence],
+    *,
+    max_findings: int = 3,
+) -> list[CitedField]:
+    findings: list[CitedField] = []
+    for source in sources[:max_findings]:
+        text = trim_visible_text(source.excerpt)
+        if text_is_substantive(text) and not text_has_internal_artifact(text):
+            findings.append(CitedField(text=text, citation_ids=[source.citation_id]))
+    return findings
+
+
+def normalize_module_cited_fields(module: InsightModuleOutput) -> InsightModuleOutput:
+    summary = module.summary
+    if summary is not None:
+        summary = normalize_cited_field_for_api(summary)
+    return module.model_copy(
+        update={
+            "direct_answer": normalize_cited_field_for_api(module.direct_answer),
+            "key_findings": [normalize_cited_field_for_api(item) for item in module.key_findings],
+            "recommended_actions": [normalize_cited_field_for_api(item) for item in module.recommended_actions],
+            "summary": summary,
+        }
+    )
+
+
 def category_validation_questions(module_key: str) -> list[str]:
     keyed = LIMITED_EVIDENCE_COPY.get(module_key, {}).get("validation_questions")
     if isinstance(keyed, list) and len(keyed) >= 2:
@@ -415,12 +456,21 @@ def build_limited_evidence_module(
     validation_questions = category_validation_questions(module_key)
 
     direct_answer = parse_cited_field(direct_text, max_sources=max_sources, fallback_ids=[])
-    key_findings = [
-        parse_cited_field(item, max_sources=max_sources, fallback_ids=[1] if sources else [])
-        for item in findings_text[:3]
-    ]
+    source_findings = build_source_supported_findings(sources) if sources else []
+    if len(source_findings) >= 2:
+        key_findings = source_findings[:3]
+    else:
+        category_findings = [
+            parse_cited_field(item, max_sources=max_sources, fallback_ids=[1] if sources else [])
+            for item in findings_text[:3]
+        ]
+        key_findings = source_findings + category_findings
+        key_findings = key_findings[:3]
+        if len(key_findings) < 2:
+            key_findings = category_findings[:3]
+
     recommended_actions = [
-        parse_cited_field(item, max_sources=max_sources, fallback_ids=[1] if sources else [])
+        parse_cited_field(item, max_sources=max_sources, fallback_ids=[])
         for item in actions_text[:3]
     ]
 
@@ -581,6 +631,7 @@ def finalize_insight_module(
 
 def serialize_module_for_api(module: InsightModuleOutput) -> dict[str, Any]:
     """Final backend validator immediately before API serialization."""
+    module = normalize_module_cited_fields(module)
     ok, _ = validate_module_output(module)
     if not ok or module_has_visible_artifacts(module):
         module = build_limited_evidence_module(
@@ -589,6 +640,7 @@ def serialize_module_for_api(module: InsightModuleOutput) -> dict[str, Any]:
             title=module.title,
             sources=module.sources,
         )
+        module = normalize_module_cited_fields(module)
 
     payload = module.model_dump()
     if module.status == "limited_evidence":

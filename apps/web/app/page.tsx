@@ -146,6 +146,44 @@ function citedTextStr(val: CitedText | string | undefined): string {
   return val.text || "";
 }
 
+function parseAskAnswer(value: unknown): CitedText {
+  if (value && typeof value === "object" && "text" in value) {
+    const cited = value as CitedText;
+    return {
+      text: typeof cited.text === "string" ? cited.text : "",
+      citation_ids: Array.isArray(cited.citation_ids) ? cited.citation_ids : [],
+    };
+  }
+  if (typeof value !== "string") {
+    return { text: "", citation_ids: [] };
+  }
+  const trimmed = value.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        direct_answer?: { text?: string; citation_ids?: number[] };
+        text?: string;
+        citation_ids?: number[];
+      };
+      if (parsed.direct_answer && typeof parsed.direct_answer.text === "string") {
+        return {
+          text: parsed.direct_answer.text,
+          citation_ids: parsed.direct_answer.citation_ids ?? [],
+        };
+      }
+      if (typeof parsed.text === "string") {
+        return {
+          text: parsed.text,
+          citation_ids: parsed.citation_ids ?? [],
+        };
+      }
+    } catch {
+      // Fall through to plain-text handling.
+    }
+  }
+  return { text: value, citation_ids: [] };
+}
+
 function citedTextIds(val: CitedText | string | undefined): number[] {
   if (!val || typeof val === "string") return [];
   return val.citation_ids || [];
@@ -560,16 +598,13 @@ export default function Home() {
         setAskSources(resp.sources ?? []);
         setAskFindings(resp.source_backed_findings ?? []);
         setAskRecommendations(resp.advisor_recommendations ?? []);
-        setAskAnswer(typeof resp.answer === "object" ? resp.answer : { text: resp.answer ?? msg, citation_ids: [] });
+        setAskAnswer(parseAskAnswer(resp.answer ?? msg));
         setEvidenceNote(resp.evidence_note ?? resp.brief?.evidence_note ?? null);
         setAnswerMode(resp.answer_mode ?? null);
         return;
       }
 
-      const answerObj =
-        typeof resp.answer === "object"
-          ? resp.answer
-          : { text: resp.answer ?? "", citation_ids: [] as number[] };
+      const answerObj = parseAskAnswer(resp.answer);
 
       setChat((c) => [...c, { role: "assistant", text: answerObj.text }]);
       recordApiResponseMeta(resp);
