@@ -60,6 +60,60 @@ class CitationContractTests(unittest.TestCase):
         self.assertNotRegex(cleaned, UUID_PATTERN)
         self.assertNotIn("ductivity", cleaned.lower())
 
+    def test_clean_source_excerpt_preserves_business_language_without_uuid(self):
+        raw = (
+            "Warehouse overtime was 10.4% against target. "
+            "[e94ac050-3724-4e92-b459-6a85718a028c:41]"
+        )
+        packets, _ = build_clean_source_packets(
+            [
+                {
+                    "id": "e94ac050-3724-4e92-b459-6a85718a028c:41",
+                    "score": 0.9,
+                    "text": raw,
+                    "metadata": {
+                        "doc_id": "e94ac050-3724-4e92-b459-6a85718a028c",
+                        "chunk_id": "41",
+                        "start": 12000,
+                    },
+                }
+            ],
+            document_name="meridian_cold_chain_financial_package.pdf",
+        )
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(packets[0]["citation_id"], 1)
+        self.assertIn("Warehouse overtime was 10.4% against target.", packets[0]["excerpt"])
+        self.assertNotRegex(packets[0]["excerpt"], UUID_PATTERN)
+
+    def test_build_clean_source_packets_scans_beyond_initial_empty_matches(self):
+        usable_text = (
+            "Warehouse overtime was 10.4% against target while truck utilization "
+            "remained below planned efficiency levels."
+        )
+        empty_matches = [
+            {
+                "id": f"bad-{index}",
+                "score": 0.95 - (index * 0.01),
+                "text": "[e94ac050-3724-4e92-b459-6a85718a028c:41]",
+                "metadata": {"doc_id": "e94ac050-3724-4e92-b459-6a85718a028c", "chunk_id": str(index)},
+            }
+            for index in range(3)
+        ]
+        good_match = {
+            "id": "good-4",
+            "score": 0.7,
+            "text": usable_text,
+            "metadata": {"doc_id": "e94ac050-3724-4e92-b459-6a85718a028c", "chunk_id": "4", "start": 15000},
+        }
+        packets, _ = build_clean_source_packets(
+            [*empty_matches, good_match],
+            max_sources=3,
+            document_name="meridian_cold_chain_financial_package.pdf",
+        )
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(packets[0]["citation_id"], 1)
+        self.assertIn("Warehouse overtime was 10.4% against target", packets[0]["excerpt"])
+
     def test_strip_source_artifacts_removes_bracketed_ids(self):
         text = "Warehouse overtime is elevated [cd3d2a1b-1111-2222-3333-4444-555566667777:2]."
         cleaned = strip_source_artifacts(text)
