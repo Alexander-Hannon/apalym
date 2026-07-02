@@ -234,6 +234,21 @@ function renderMetricsChart(metrics: MetricValue[]) {
   );
 }
 
+function sourceCardTitle(source: SourceEvidence): string {
+  const title = source.title?.trim();
+  if (title && title.startsWith("Source excerpt")) return title;
+  return `Source excerpt ${source.citation_id}`;
+}
+
+function renderSourceCardSummary(source: SourceEvidence) {
+  return (
+  <>
+    <p className="source-title">{sourceCardTitle(source)}</p>
+    {source.page != null && <p className="source-confidence">Page {source.page}</p>}
+  </>
+  );
+}
+
 function renderEvidenceQualityCard(
   insight: InsightModule,
   sources: SourceEvidence[],
@@ -985,8 +1000,7 @@ export default function Home() {
                           <summary>
                             <span className="source-number">{source.citation_id}</span>
                             <div>
-                              <p className="source-title">Source {source.citation_id}</p>
-                              <p className="source-confidence">{source.document_name}</p>
+                              {renderSourceCardSummary(source)}
                             </div>
                           </summary>
                           {source.excerpt && (
@@ -1105,8 +1119,7 @@ export default function Home() {
                     <summary>
                       <span className="source-number">{source.citation_id}</span>
                       <div>
-                        <p className="source-title">Source {source.citation_id}</p>
-                        <p className="source-confidence">{source.document_name}</p>
+                        {renderSourceCardSummary(source)}
                       </div>
                     </summary>
                     {source.excerpt && (
@@ -1126,13 +1139,12 @@ export default function Home() {
           <div className="evidence-modal-backdrop" onClick={() => setSelectedEvidence(null)}>
             <div className="evidence-modal" onClick={(event) => event.stopPropagation()}>
               <div className="evidence-modal-head">
-                <h3>Source {selectedEvidence.citation_id}</h3>
+                <h3>{sourceCardTitle(selectedEvidence)}</h3>
                 <button type="button" className="ghost-btn" onClick={() => setSelectedEvidence(null)}>
                   Close
                 </button>
               </div>
-              <p className="source-confidence">{selectedEvidence.document_name}</p>
-              {selectedEvidence.page && <p className="source-page">Page {selectedEvidence.page}</p>}
+              {selectedEvidence.page != null && <p className="source-page">Page {selectedEvidence.page}</p>}
               <p className="source-preview">{selectedEvidence.excerpt}</p>
             </div>
           </div>

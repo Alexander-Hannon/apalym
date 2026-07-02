@@ -125,7 +125,20 @@ class CitationContractTests(unittest.TestCase):
         self.assertEqual(cited["citation_ids"], [1, 2])
         self.assertNotIn("[", cited["text"])
 
-    def test_build_public_sources_omit_internal_ids(self):
+    def test_build_public_sources_hides_uuid_filenames(self):
+        packets = [
+            {
+                "citation_id": 1,
+                "document_name": "fdc6d32b-0225-4f9e-a84b-8f3b5f496d4f.pdf",
+                "page": 7,
+                "excerpt": "Warehouse overtime was 10.4% against a target below 7.5%.",
+                "title": "Source evidence",
+            }
+        ]
+        sources = build_public_sources(packets)
+        self.assertEqual(sources[0].document_name, "Uploaded document")
+        self.assertEqual(sources[0].title, "Source excerpt 1")
+
         packets, _ = build_clean_source_packets(
             [
                 {
@@ -139,6 +152,7 @@ class CitationContractTests(unittest.TestCase):
         )
         sources = build_public_sources(packets)
         self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].title, "Source excerpt 1")
         self.assertEqual(sources[0].document_name, "meridian_cold_chain_financial_package.pdf")
         dumped = json.dumps([source.model_dump() for source in sources])
         self.assertNotIn("source_id", dumped)

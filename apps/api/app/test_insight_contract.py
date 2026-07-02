@@ -17,13 +17,13 @@ from app.insight_contract import (
 
 
 class InsightContractResetTests(unittest.TestCase):
-    def test_text_fields_reject_citation_syntax_in_prose(self):
+    def test_text_fields_strip_citation_syntax_but_preserve_prose(self):
         cited = parse_cited_field(
             {"text": "Labor pressure is rising. [1, 2]", "citation_ids": [1, 2]},
             max_sources=3,
         )
         self.assertEqual(cited.citation_ids, [1, 2])
-        self.assertEqual(cited.text, "")
+        self.assertEqual(cited.text, "Labor pressure is rising.")
         self.assertTrue(text_has_citation_syntax("Labor pressure is rising. [1, 2]"))
 
     def test_internal_uuid_bracket_rejected(self):
@@ -100,7 +100,7 @@ class InsightContractResetTests(unittest.TestCase):
         self.assertNotIn("ductivity", module.direct_answer.text.lower())
         self.assertTrue(reasons)
 
-    def test_serialize_rebuilds_contaminated_ready_module(self):
+    def test_serialize_rebuilds_contaminated_ready_module_with_one_source(self):
         contaminated = InsightModuleOutput(
             module_key="losses",
             module_id="loss-leakage",
@@ -129,6 +129,52 @@ class InsightContractResetTests(unittest.TestCase):
         payload = serialize_module_for_api(contaminated)
         self.assertEqual(payload["status"], "limited_evidence")
         self.assertFalse(text_has_internal_artifact(payload["direct_answer"]["text"]))
+
+    def test_serialize_preserves_ready_module_with_three_sources(self):
+        contaminated = InsightModuleOutput(
+            module_key="losses",
+            module_id="loss-leakage",
+            title="Where are we losing money?",
+            status="ready",
+            confidence="high",
+            direct_answer=CitedField(
+                text="Warehouse overtime is above target and appears to be a recurring operational issue.",
+                citation_ids=[1],
+            ),
+            key_findings=[
+                CitedField(text="Truck utilization is below the operating target.", citation_ids=[2]),
+            ],
+            recommended_actions=[
+                CitedField(text="Review overtime by site and shift.", citation_ids=[1]),
+            ],
+            evidence_limitations=EvidenceLimitations(message=None, validation_questions=[]),
+            sources=[
+                SourceEvidence(
+                    citation_id=1,
+                    document_name="meridian_cold_chain_financial_package.pdf",
+                    page=7,
+                    excerpt="Warehouse overtime was 10.4% against a target below 7.5%.",
+                ),
+                SourceEvidence(
+                    citation_id=2,
+                    document_name="meridian_cold_chain_financial_package.pdf",
+                    page=8,
+                    excerpt="Days sales outstanding was 38.6 days versus a target below 35 days.",
+                ),
+                SourceEvidence(
+                    citation_id=3,
+                    document_name="meridian_cold_chain_financial_package.pdf",
+                    page=9,
+                    excerpt="Truck utilization remained below planned efficiency levels.",
+                ),
+            ],
+        )
+        payload = serialize_module_for_api(contaminated)
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["confidence"], "medium")
+        self.assertGreaterEqual(len(payload["key_findings"]), 2)
+        self.assertGreaterEqual(len(payload["recommended_actions"]), 2)
+        self.assertEqual(len(payload["sources"]), 3)
 
 
 if __name__ == "__main__":

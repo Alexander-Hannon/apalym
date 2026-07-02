@@ -247,8 +247,10 @@ class InsightPilotDeadlineTests(unittest.TestCase):
         self.assertEqual(response.headers.get("x-apalym-insight-pipeline"), INSIGHT_PIPELINE_VERSION)
         self.assertIsNotNone(response.headers.get("x-apalym-insight-elapsed-ms"))
         self.assertEqual(len(payload["modules"]), 5)
+        ready_count = sum(1 for module in payload["modules"] if module["status"] == "ready")
+        self.assertGreaterEqual(ready_count, 1)
         for module in payload["modules"]:
-            self.assertEqual(module["status"], "limited_evidence")
+            self.assertIn(module["status"], {"ready", "limited_evidence"})
 
 
 if __name__ == "__main__":
