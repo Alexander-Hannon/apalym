@@ -954,31 +954,86 @@ def log_insight_stage_uuid_scan(
 
 
 def clean_source_excerpt(text: str) -> str:
+    """
+    Convert a raw retrieval chunk into safe, visible evidence text.
+
+    Important:
+    - Remove internal IDs / chunk markers.
+    - Preserve the surrounding business language.
+    - Never return raw UUIDs, Pinecone IDs, doc IDs, or chunk IDs.
+    - Return an empty string only when no meaningful readable evidence remains.
+    """
     if not isinstance(text, str):
         return ""
+
     cleaned = text.replace("\x00", " ")
-    cleaned = _RAW_BRACKETED_SOURCE_PATTERN.sub("", cleaned)
-    cleaned = _BRACKETED_INTERNAL_ID_RE.sub("", cleaned)
-    cleaned = _UUID_LIKE_PATTERN.sub("", cleaned)
-    cleaned = re.sub(r"\[[^\]]*:[^\]]*\]", "", cleaned)
-    cleaned = _RAW_INTERNAL_ID_PATTERN.sub("", cleaned)
-    cleaned = re.sub(r"```+", "", cleaned)
-    cleaned = re.sub(r"(?im)^\s*(csv columns|columns|sheet):.*$", "", cleaned)
-    cleaned = re.sub(r"(?i)\brow\s+\d+\s*:\s*", "", cleaned)
-    cleaned = re.sub(r"[\r\t]+", " ", cleaned)
+
+    # Remove internal retrieval markers while preserving surrounding text.
+    # Examples:
+    # [e94ac050-3724-4e92-b459-6a85718a028c:41]
+    # [uuid]
+    # source_id=...
+    # doc_id=...
+    # chunk_id=...
+    cleaned = _RAW_BRACKETED_SOURCE_PATTERN.sub(" ", cleaned)
+    cleaned = _BRACKETED_INTERNAL_ID_RE.sub(" ", cleaned)
+    cleaned = _RAW_UUID_CHUNK_PATTERN.sub(" ", cleaned)
+    cleaned = _UUID_LIKE_PATTERN.sub(" ", cleaned)
+
+    cleaned = re.sub(
+        r"\b(?:doc_id|chunk_id|source_id)\s*[:=]\s*[A-Za-z0-9_.:-]+\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = re.sub(
+        r"\b(?:source|chunk|document)\s*[:=]\s*[A-Za-z0-9_.:-]+\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove generic bracket metadata only when it is clearly an internal marker.
+    # Do NOT erase normal human-readable bracket content.
+    cleaned = re.sub(
+        r"\[(?:source:)?[A-Za-z0-9_.:-]*(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|chunk_|doc_|source_)[^\]]*\]",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = re.sub(r"```+", " ", cleaned)
+    cleaned = re.sub(r"(?im)^\s*(csv columns|columns|sheet):.*$", " ", cleaned)
+    cleaned = re.sub(r"(?i)\brow\s+\d+\s*:\s*", " ", cleaned)
+    cleaned = re.sub(r"[\r\t\n]+", " ", cleaned)
     cleaned = compact_whitespace(cleaned)
+
     if not cleaned:
         return ""
 
-    table_like = _looks_like_table_row_dump(cleaned)
+    # If chunking begins mid-word, remove only that broken first token.
+    # Example: "ductivity problem Warehouse overtime..." becomes
+    # "problem Warehouse overtime..."
     if _BROKEN_LEADING_SUFFIXES.match(cleaned):
         words = cleaned.split()
         cleaned = " ".join(words[1:]).strip()
-        table_like = True
 
-    if table_like:
-        cleaned = f"Excerpt contains table data. Key values: {cleaned}"
+    cleaned = compact_whitespace(cleaned)
 
+    # Must contain enough actual words to be useful evidence.
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", cleaned)
+    if len(words) < 5:
+        return ""
+
+    # Reject only strings that are still clearly raw internal artifacts.
+    if _UUID_LIKE_PATTERN.search(cleaned):
+        return ""
+
+    if _RAW_INTERNAL_ID_PATTERN.search(cleaned):
+        return ""
+
+    # Keep evidence readable and compact for prompt + source drawer.
     return trim_snippet_text(cleaned, 520)
 
 
@@ -1020,15 +1075,48 @@ def build_clean_source_packets(
     max_sources: int = 3,
     document_name: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
+    """
+    Build up to max_sources clean public evidence packets.
+
+    Important:
+    Do NOT only inspect retrieved_chunks[:max_sources].
+    The first few retrieval hits may be malformed, overlapping, truncated,
+    or metadata-heavy. Continue scanning later matches until we collect
+    max_sources usable evidence packets.
+    """
     source_packets: list[dict[str, Any]] = []
     context_blocks: list[str] = []
+    seen_excerpts: set[str] = set()
 
-    for match in retrieved_chunks[:max_sources]:
-        excerpt = clean_source_excerpt((match.get("text") or "").strip())
+    for match in retrieved_chunks:
+        if len(source_packets) >= max_sources:
+            break
+
+        md = match.get("metadata") or {}
+
+        # Use retrieval text first, then safe metadata fallbacks.
+        raw_text = (
+            match.get("text")
+            or md.get("text")
+            or md.get("chunk_text")
+            or md.get("content")
+            or ""
+        )
+
+        excerpt = clean_source_excerpt(str(raw_text).strip())
+
         if not excerpt:
             continue
+
+        # Avoid sending substantially duplicated overlapping chunks.
+        excerpt_key = re.sub(r"[^a-z0-9]+", " ", excerpt.lower()).strip()
+        if not excerpt_key or excerpt_key in seen_excerpts:
+            continue
+
+        seen_excerpts.add(excerpt_key)
+
         source_number = len(source_packets) + 1
-        md = match.get("metadata") or {}
+
         packet = {
             "source_number": source_number,
             "citation_id": source_number,
@@ -1038,10 +1126,13 @@ def build_clean_source_packets(
             "page": _estimate_page_from_chunk(md),
             "excerpt": excerpt,
             "confidence": _source_confidence_label(match.get("score")),
+
+            # Internal only. Do not expose these through public response serialization.
             "internal_doc_id": md.get("doc_id"),
             "internal_chunk_id": md.get("chunk_id"),
             "internal_source_id": match.get("id"),
         }
+
         source_packets.append(packet)
         context_blocks.append(format_source_packet_block(packet))
 
