@@ -71,7 +71,7 @@ class InsightContractResetTests(unittest.TestCase):
         ok, reasons = validate_module_output(module)
         self.assertTrue(ok, reasons)
 
-    def test_finalize_returns_limited_evidence_for_bad_generation(self):
+    def test_finalize_preserves_cleaned_generation_with_one_source(self):
         module, reasons = finalize_insight_module(
             module_key="risks",
             module_id="key-risks",
@@ -94,13 +94,15 @@ class InsightContractResetTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(module.status, "limited_evidence")
-        self.assertGreaterEqual(len(module.evidence_limitations.validation_questions), 2)
+        self.assertEqual(module.status, "ready")
+        self.assertGreaterEqual(len(module.evidence_limitations.validation_questions), 0)
         self.assertFalse(text_has_internal_artifact(module.direct_answer.text))
         self.assertNotIn("ductivity", module.direct_answer.text.lower())
+        self.assertIn("Capex", module.direct_answer.text)
+        self.assertEqual(len(module.sources), 1)
         self.assertTrue(reasons)
 
-    def test_serialize_rebuilds_contaminated_ready_module_with_one_source(self):
+    def test_serialize_repairs_contaminated_ready_module_with_one_source(self):
         contaminated = InsightModuleOutput(
             module_key="losses",
             module_id="loss-leakage",
@@ -127,8 +129,10 @@ class InsightContractResetTests(unittest.TestCase):
             ],
         )
         payload = serialize_module_for_api(contaminated)
-        self.assertEqual(payload["status"], "limited_evidence")
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(len(payload["sources"]), 1)
         self.assertFalse(text_has_internal_artifact(payload["direct_answer"]["text"]))
+        self.assertIn("Warehouse overtime", payload["direct_answer"]["text"])
 
     def test_serialize_preserves_ready_module_with_three_sources(self):
         contaminated = InsightModuleOutput(

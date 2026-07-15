@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from typing import Any, Literal
 
@@ -232,12 +234,119 @@ def build_public_sources(source_packets: list[dict[str, Any]]) -> list[SourceEvi
     return sources
 
 
-def count_usable_sources(sources: list[SourceEvidence]) -> int:
-    return sum(
-        1
-        for source in sources
-        if compact_whitespace(source.excerpt) and not text_has_internal_artifact(source.excerpt)
+def source_excerpt_is_usable(excerpt: str) -> bool:
+    """Source drawer excerpts may contain bracketed values; only reject truly raw IDs."""
+    cleaned = compact_whitespace(excerpt)
+    if len(cleaned) < 10:
+        return False
+    return not (
+        _UUID_PATTERN.search(cleaned)
+        or _UUID_CHUNK_PATTERN.search(cleaned)
+        or _BRACKETED_INTERNAL_ID.search(cleaned)
     )
+
+
+def count_usable_sources(sources: list[SourceEvidence]) -> int:
+    return sum(1 for source in sources if source_excerpt_is_usable(source.excerpt))
+
+
+def text_has_raw_uuid(text: str) -> bool:
+    cleaned = compact_whitespace(text)
+    if not cleaned:
+        return False
+    return bool(
+        _UUID_PATTERN.search(cleaned)
+        or _UUID_CHUNK_PATTERN.search(cleaned)
+        or _BRACKETED_INTERNAL_ID.search(cleaned)
+    )
+
+
+def cited_field_passes_safety_gate(field: CitedField) -> bool:
+    """Content-quality gate for visible generated prose (separate from evidence confidence)."""
+    cleaned = clean_cited_field_text(field.text)
+    if not text_is_substantive(cleaned):
+        return False
+    if text_has_raw_uuid(cleaned):
+        return False
+    if text_looks_like_raw_table_dump(cleaned):
+        return False
+    if _BROKEN_LEADING.match(cleaned) or _REPEATED_LABEL.search(cleaned):
+        return False
+    return True
+
+
+def count_safety_passing_fields(fields: list[CitedField]) -> int:
+    return sum(1 for field in fields if cited_field_passes_safety_gate(field))
+
+
+def generated_content_passes_safety_gate(
+    direct_answer: CitedField,
+    key_findings: list[CitedField],
+    recommended_actions: list[CitedField],
+) -> bool:
+    if not cited_field_passes_safety_gate(direct_answer):
+        return False
+    if text_has_raw_uuid(direct_answer.text):
+        return False
+    for field in [*key_findings, *recommended_actions]:
+        if text_has_raw_uuid(field.text):
+            return False
+    return True
+
+
+def should_downgrade_to_limited_evidence(
+    *,
+    source_packet_count: int,
+    direct_answer: CitedField,
+    key_findings: list[CitedField],
+    recommended_actions: list[CitedField],
+) -> tuple[bool, str | None]:
+    if source_packet_count < 1:
+        return True, "no_usable_sources"
+
+    direct_safe = cited_field_passes_safety_gate(direct_answer)
+    findings_safe_count = count_safety_passing_fields(key_findings)
+    actions_safe_count = count_safety_passing_fields(recommended_actions)
+    both_lists_unusable = findings_safe_count == 0 and actions_safe_count == 0
+    has_any_safe_content = direct_safe or findings_safe_count > 0 or actions_safe_count > 0
+
+    if any(
+        text_has_raw_uuid(field.text)
+        for field in [direct_answer, *key_findings, *recommended_actions]
+        if compact_whitespace(field.text)
+    ):
+        return True, "field_raw_uuid"
+
+    if not has_any_safe_content:
+        return True, "all_content_unusable"
+
+    if not compact_whitespace(direct_answer.text) and both_lists_unusable:
+        return True, "empty_direct_answer_and_lists_unusable"
+
+    if source_packet_count >= 2 and has_any_safe_content:
+        return False, None
+
+    if source_packet_count >= 1 and direct_safe:
+        return False, None
+
+    if source_packet_count >= 1 and not both_lists_unusable:
+        return False, None
+
+    return True, "insufficient_safe_content"
+
+
+def compute_module_confidence(
+    source_packet_count: int,
+    *,
+    fully_valid: bool,
+) -> InsightConfidence:
+    if source_packet_count >= 3 and fully_valid:
+        return "high"
+    if source_packet_count >= 2:
+        return "medium"
+    if source_packet_count == 1:
+        return "medium" if fully_valid else "low"
+    return "low"
 
 
 def validate_cited_field(field: CitedField, *, max_sources: int, field_name: str) -> list[str]:
@@ -650,7 +759,7 @@ def build_partial_module_completion(
         and len([field for field in key_findings if cited_field_is_usable(field)]) >= 2
         and len([field for field in recommended_actions if cited_field_is_usable(field)]) >= 2
     )
-    confidence: InsightConfidence = "high" if max_sources >= 3 and fully_valid else "medium"
+    confidence = compute_module_confidence(max_sources, fully_valid=fully_valid)
 
     return InsightModuleOutput(
         module_key=module_key,
@@ -710,97 +819,139 @@ def finalize_insight_module(
     source_packets: list[dict[str, Any]],
 ) -> tuple[InsightModuleOutput, list[str]]:
     sources = build_public_sources(source_packets)
+    source_packet_count = len(source_packets)
     max_sources = len(sources)
-    usable_sources = count_usable_sources(sources)
     default_ids = [sources[0].citation_id] if sources else []
     reasons: list[str] = []
 
-    if usable_sources == 0:
-        return (
-            build_limited_evidence_module(
-                module_key=module_key,
-                module_id=module_id,
-                title=title,
-                sources=[],
-            ),
-            ["no_usable_sources"],
-        )
-
     parsed = parse_generated_module(generated, max_sources=max_sources, default_ids=default_ids) if generated else None
+    direct_answer = parsed["direct_answer"] if parsed else parse_cited_field("", max_sources=max_sources)
+    key_findings = parsed["key_findings"] if parsed else []
+    recommended_actions = parsed["recommended_actions"] if parsed else []
 
-    if usable_sources >= 2:
-        if not parsed:
-            reasons.append("parse_failed")
-            module = build_partial_module_completion(
-                module_key=module_key,
-                module_id=module_id,
-                title=title,
-                sources=sources,
-                direct_answer=parse_cited_field("", max_sources=max_sources),
-                key_findings=[],
-                recommended_actions=[],
-            )
-            return module, reasons
+    downgrade, downgrade_reason = should_downgrade_to_limited_evidence(
+        source_packet_count=source_packet_count,
+        direct_answer=direct_answer,
+        key_findings=key_findings,
+        recommended_actions=recommended_actions,
+    )
 
-        module = build_partial_module_completion(
-            module_key=module_key,
-            module_id=module_id,
-            title=title,
-            sources=sources,
-            direct_answer=parsed["direct_answer"],
-            key_findings=parsed["key_findings"],
-            recommended_actions=parsed["recommended_actions"],
-        )
-        if len(parsed["key_findings"]) < 2:
-            reasons.append("key_findings_supplemented")
-        if len(parsed["recommended_actions"]) < 2:
-            reasons.append("recommended_actions_supplemented")
-        if not cited_field_is_usable(parsed["direct_answer"]):
-            reasons.append("direct_answer_supplemented")
-        return module, reasons
-
-    # Single usable source: limited_evidence unless generation is fully usable.
-    if not parsed or not cited_field_is_usable(parsed["direct_answer"]):
+    if downgrade:
         return (
             build_limited_evidence_module(
                 module_key=module_key,
                 module_id=module_id,
                 title=title,
-                sources=sources,
+                sources=sources if source_packet_count > 0 else [],
             ),
-            ["single_source_insufficient_generation"],
+            [downgrade_reason or "limited_evidence"],
         )
+
+    if not parsed:
+        reasons.append("parse_failed")
 
     module = build_partial_module_completion(
         module_key=module_key,
         module_id=module_id,
         title=title,
         sources=sources,
-        direct_answer=parsed["direct_answer"],
-        key_findings=parsed["key_findings"],
-        recommended_actions=parsed["recommended_actions"],
+        direct_answer=direct_answer,
+        key_findings=key_findings,
+        recommended_actions=recommended_actions,
     )
-    module = module.model_copy(update={"confidence": "low"})
-    if len(parsed["key_findings"]) < 2 or len(parsed["recommended_actions"]) < 2:
-        return (
-            build_limited_evidence_module(
-                module_key=module_key,
-                module_id=module_id,
-                title=title,
-                sources=sources,
-            ),
-            ["single_source_partial_generation"],
-        )
-    return module, ["single_source_ready"]
+
+    if len(key_findings) < 2:
+        reasons.append("key_findings_supplemented")
+    if len(recommended_actions) < 2:
+        reasons.append("recommended_actions_supplemented")
+    if not cited_field_passes_safety_gate(direct_answer):
+        reasons.append("direct_answer_supplemented")
+
+    fully_valid = (
+        cited_field_is_usable(direct_answer)
+        and count_safety_passing_fields(key_findings) >= 2
+        and count_safety_passing_fields(recommended_actions) >= 2
+    )
+    confidence = compute_module_confidence(source_packet_count, fully_valid=fully_valid)
+    if source_packet_count == 1 and confidence == "low":
+        reasons.append("single_source_ready")
+
+    module = module.model_copy(update={"confidence": confidence})
+    return module, reasons
 
 
-def serialize_module_for_api(module: InsightModuleOutput) -> dict[str, Any]:
+def log_module_quality_gate(
+    *,
+    module_key: str,
+    retrieved_chunk_count: int,
+    source_packet_count: int,
+    module: InsightModuleOutput,
+    preserved_generated_module: bool,
+    limited_evidence_reason: str | None,
+    downgraded_to_limited_evidence: bool,
+    **extra: Any,
+) -> None:
+    """Emit structured quality-gate diagnostics to server logs only."""
+    direct_safe = cited_field_passes_safety_gate(module.direct_answer)
+    payload = {
+        "level": "INFO",
+        "event": "insight_module_quality_gate",
+        "module_key": module_key,
+        "retrieved_chunk_count": retrieved_chunk_count,
+        "usable_source_packet_count": source_packet_count,
+        "generated_has_uuid": any(
+            text_has_raw_uuid(field.text)
+            for field in [module.direct_answer, *module.key_findings, *module.recommended_actions]
+        ),
+        "generated_has_raw_fragment": module_has_visible_artifacts(module),
+        "direct_answer_quality_pass": direct_safe,
+        "findings_quality_pass_count": count_safety_passing_fields(module.key_findings),
+        "actions_quality_pass_count": count_safety_passing_fields(module.recommended_actions),
+        "final_status": module.status,
+        "final_confidence": module.confidence,
+        "final_source_count": len(module.sources),
+        "downgraded_to_limited_evidence": downgraded_to_limited_evidence,
+        "downgrade_reason": limited_evidence_reason,
+        "preserved_generated_module": preserved_generated_module,
+        "limited_evidence_reason": limited_evidence_reason,
+        **extra,
+    }
+    logging.getLogger("apalym.api").info(json.dumps(payload, default=str))
+
+
+def serialize_module_for_api(
+    module: InsightModuleOutput,
+    *,
+    log_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Final backend validator immediately before API serialization."""
     module = normalize_module_cited_fields(module)
-    ok, reasons = validate_module_output(module)
-    usable_sources = count_usable_sources(module.sources)
+    source_packet_count = len(module.sources)
+    generated_has_raw_fragment = module_has_visible_artifacts(module)
 
-    if (not ok or module_has_visible_artifacts(module)) and usable_sources >= 2:
+    ok, _reasons = validate_module_output(module)
+    downgrade, downgrade_reason = should_downgrade_to_limited_evidence(
+        source_packet_count=source_packet_count,
+        direct_answer=module.direct_answer,
+        key_findings=module.key_findings,
+        recommended_actions=module.recommended_actions,
+    )
+
+    preserved_generated_module = module.status == "ready" and not downgrade
+    limited_evidence_reason: str | None = None
+
+    if downgrade:
+        limited_evidence_reason = downgrade_reason
+        preserved_generated_module = False
+        module = build_limited_evidence_module(
+            module_key=module.module_key,
+            module_id=module.module_id,
+            title=module.title,
+            sources=module.sources if source_packet_count > 0 else [],
+        )
+        module = normalize_module_cited_fields(module)
+    elif not ok or generated_has_raw_fragment:
+        preserved_generated_module = True
         module = build_partial_module_completion(
             module_key=module.module_key,
             module_id=module.module_id,
@@ -811,14 +962,18 @@ def serialize_module_for_api(module: InsightModuleOutput) -> dict[str, Any]:
             recommended_actions=module.recommended_actions,
         )
         module = normalize_module_cited_fields(module)
-    elif not ok or module_has_visible_artifacts(module):
-        module = build_limited_evidence_module(
+
+    if log_context is not None:
+        log_module_quality_gate(
             module_key=module.module_key,
-            module_id=module.module_id,
-            title=module.title,
-            sources=module.sources,
+            retrieved_chunk_count=int(log_context.get("retrieved_chunk_count", 0)),
+            source_packet_count=source_packet_count,
+            module=module,
+            preserved_generated_module=preserved_generated_module,
+            limited_evidence_reason=limited_evidence_reason,
+            downgraded_to_limited_evidence=module.status == "limited_evidence",
+            **{k: v for k, v in log_context.items() if k != "retrieved_chunk_count"},
         )
-        module = normalize_module_cited_fields(module)
 
     payload = module.model_dump()
     if module.status == "limited_evidence":
