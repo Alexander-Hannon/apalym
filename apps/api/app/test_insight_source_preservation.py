@@ -91,8 +91,9 @@ class InsightSourcePreservationTests(unittest.TestCase):
             source_packets=packets,
         )
         payload = serialize_module_for_api(module_output)
-        self.assertEqual(payload["status"], "limited_evidence")
-        self.assertGreaterEqual(len(payload["sources"]), 1)
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["confidence"], "medium")
+        self.assertGreaterEqual(len(payload["sources"]), 2)
         self.assertTrue(reasons)
         for text in collect_visible_text_fields(payload):
             self.assertFalse(text_has_internal_artifact(text), text)

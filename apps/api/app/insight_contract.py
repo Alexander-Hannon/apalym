@@ -90,6 +90,11 @@ _GENERIC_MARKERS: tuple[tuple[str, ...], ...] = (
     ("module", "clean diagnosis"),
     ("could not be assembled",),
 )
+_TABLE_ROW_DUMP = re.compile(
+    r"\b\d+\s+\d+\s+\(\d+\)\s+\d+\s+\d+\b|"
+    r"(?:row\s+\d+[:\s].*){2,}",
+    re.IGNORECASE,
+)
 
 
 def compact_whitespace(text: str) -> str:
@@ -124,16 +129,51 @@ def text_is_substantive(text: str, *, min_len: int = 24) -> bool:
     return len(cleaned) >= min_len and not text_is_generic_placeholder(cleaned)
 
 
+def text_looks_like_raw_table_dump(text: str) -> bool:
+    cleaned = compact_whitespace(text)
+    if not cleaned:
+        return False
+    if _TABLE_ROW_DUMP.search(cleaned):
+        return True
+    label_count = len(re.findall(r"\b[A-Za-z][A-Za-z0-9 /%$&().-]{1,35}:\s*\S", cleaned))
+    numeric_tokens = sum(
+        1
+        for token in cleaned.split()[:20]
+        if re.search(r"^\(?-?\$?\d+(?:[.,]\d+)?%?\)?$", token)
+    )
+    return numeric_tokens >= 5 and label_count >= 3
+
+
 def strip_inline_citations_from_text(text: str) -> str:
-    """Legacy helper for non-user-facing fields only (e.g. evidence_note)."""
     cleaned = text or ""
-    cleaned = _BRACKETED_INTERNAL_ID.sub("", cleaned)
-    cleaned = _UUID_CHUNK_PATTERN.sub("", cleaned)
-    cleaned = _UUID_PATTERN.sub("", cleaned)
-    cleaned = _CITATION_SYNTAX_IN_TEXT.sub("", cleaned)
-    cleaned = _INTERNAL_FIELD_NAMES.sub("", cleaned)
+    cleaned = _BRACKETED_INTERNAL_ID.sub(" ", cleaned)
+    cleaned = _UUID_CHUNK_PATTERN.sub(" ", cleaned)
+    cleaned = _UUID_PATTERN.sub(" ", cleaned)
+    cleaned = _CITATION_SYNTAX_IN_TEXT.sub(" ", cleaned)
+    cleaned = _INTERNAL_FIELD_NAMES.sub(" ", cleaned)
+    cleaned = re.sub(
+        r"\b(?:doc_id|chunk_id|source_id)\s*[:=]\s*[A-Za-z0-9_.:-]+\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = compact_whitespace(cleaned)
+    if _BROKEN_LEADING.match(cleaned):
+        words = cleaned.split()
+        cleaned = " ".join(words[1:]).strip() if len(words) > 1 else ""
     return compact_whitespace(cleaned)
+
+
+def clean_cited_field_text(text: str) -> str:
+    cleaned = strip_inline_citations_from_text(text)
+    if text_looks_like_raw_table_dump(cleaned):
+        return ""
+    return cleaned
+
+
+def cited_field_is_usable(field: CitedField) -> bool:
+    return text_is_substantive(field.text) and not text_has_internal_artifact(field.text)
 
 
 def parse_cited_field(
@@ -156,26 +196,48 @@ def parse_cited_field(
     if not ids and fallback_ids:
         ids = [item for item in fallback_ids if 1 <= item <= max_sources]
 
-    clean_text = compact_whitespace(raw_text)
-    if text_has_internal_artifact(clean_text) or text_has_citation_syntax(clean_text):
+    clean_text = clean_cited_field_text(raw_text)
+    if not text_is_substantive(clean_text):
         clean_text = ""
 
     return CitedField(text=clean_text, citation_ids=ids)
 
 
+def _public_source_title(citation_id: int) -> str:
+    return f"Source excerpt {citation_id}"
+
+
+def _public_document_label(document_name: str | None) -> str:
+    name = compact_whitespace(document_name or "")
+    if not name:
+        return "Uploaded document"
+    if _UUID_PATTERN.search(name):
+        return "Uploaded document"
+    return name
+
+
 def build_public_sources(source_packets: list[dict[str, Any]]) -> list[SourceEvidence]:
     sources: list[SourceEvidence] = []
     for packet in source_packets:
+        citation_id = int(packet["citation_id"])
         sources.append(
             SourceEvidence(
-                citation_id=int(packet["citation_id"]),
-                document_name=packet.get("document_name") or "Uploaded document",
+                citation_id=citation_id,
+                document_name=_public_document_label(packet.get("document_name")),
                 page=packet.get("page"),
                 excerpt=packet.get("excerpt") or "",
-                title=packet.get("title") or "Source evidence",
+                title=_public_source_title(citation_id),
             )
         )
     return sources
+
+
+def count_usable_sources(sources: list[SourceEvidence]) -> int:
+    return sum(
+        1
+        for source in sources
+        if compact_whitespace(source.excerpt) and not text_has_internal_artifact(source.excerpt)
+    )
 
 
 def validate_cited_field(field: CitedField, *, max_sources: int, field_name: str) -> list[str]:
@@ -390,31 +452,88 @@ LIMITED_EVIDENCE_COPY: dict[str, dict[str, Any]] = {
 }
 
 
-def trim_visible_text(text: str, max_chars: int = 220) -> str:
-    compact = compact_whitespace(text)
-    if len(compact) <= max_chars:
-        return compact
-    return compact[: max_chars - 1].rstrip() + "…"
+def category_validation_questions(module_key: str) -> list[str]:
+    keyed = LIMITED_EVIDENCE_COPY.get(module_key, {}).get("validation_questions")
+    if isinstance(keyed, list) and len(keyed) >= 2:
+        return keyed
+    return [
+        "What supporting schedules or department-level detail would confirm this diagnosis?",
+        "Which operating metrics should be validated before acting on these recommendations?",
+    ]
+
+
+def _category_copy(module_key: str) -> dict[str, Any]:
+    return LIMITED_EVIDENCE_COPY.get(module_key, LIMITED_EVIDENCE_COPY["losses"])
+
+
+def _citation_id_for_index(sources: list[SourceEvidence], index: int) -> list[int]:
+    if not sources:
+        return []
+    source = sources[min(index, len(sources) - 1)]
+    return [source.citation_id]
+
+
+def _dedupe_cited_fields(fields: list[CitedField]) -> list[CitedField]:
+    seen: set[str] = set()
+    deduped: list[CitedField] = []
+    for field in fields:
+        key = compact_whitespace(field.text).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(field)
+    return deduped
+
+
+def _supplement_cited_fields(
+    existing: list[CitedField],
+    templates: list[str],
+    *,
+    max_sources: int,
+    sources: list[SourceEvidence],
+    min_count: int,
+    max_count: int,
+    attach_citations: bool,
+    reject_generic: bool = False,
+) -> list[CitedField]:
+    merged = _dedupe_cited_fields([field for field in existing if cited_field_is_usable(field)])
+    seen = {compact_whitespace(field.text).lower() for field in merged}
+
+    for index, template in enumerate(templates):
+        if len(merged) >= max_count:
+            break
+        fallback_ids = _citation_id_for_index(sources, index) if attach_citations else []
+        candidate = parse_cited_field(template, max_sources=max_sources, fallback_ids=fallback_ids)
+        if reject_generic and text_is_generic_placeholder(candidate.text):
+            continue
+        if not cited_field_is_usable(candidate):
+            continue
+        key = compact_whitespace(candidate.text).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(candidate)
+
+    if len(merged) < min_count:
+        for index, template in enumerate(templates):
+            if len(merged) >= min_count:
+                break
+            fallback_ids = _citation_id_for_index(sources, index) if attach_citations else []
+            candidate = parse_cited_field(template, max_sources=max_sources, fallback_ids=fallback_ids)
+            key = compact_whitespace(candidate.text).lower()
+            if key in seen or not cited_field_is_usable(candidate):
+                continue
+            seen.add(key)
+            merged.append(candidate)
+
+    return merged[:max_count]
 
 
 def normalize_cited_field_for_api(field: CitedField) -> CitedField:
-    cleaned = strip_inline_citations_from_text(field.text)
-    if text_has_internal_artifact(cleaned):
+    cleaned = clean_cited_field_text(field.text)
+    if not text_is_substantive(cleaned):
         cleaned = ""
     return CitedField(text=cleaned, citation_ids=field.citation_ids)
-
-
-def build_source_supported_findings(
-    sources: list[SourceEvidence],
-    *,
-    max_findings: int = 3,
-) -> list[CitedField]:
-    findings: list[CitedField] = []
-    for source in sources[:max_findings]:
-        text = trim_visible_text(source.excerpt)
-        if text_is_substantive(text) and not text_has_internal_artifact(text):
-            findings.append(CitedField(text=text, citation_ids=[source.citation_id]))
-    return findings
 
 
 def normalize_module_cited_fields(module: InsightModuleOutput) -> InsightModuleOutput:
@@ -431,16 +550,6 @@ def normalize_module_cited_fields(module: InsightModuleOutput) -> InsightModuleO
     )
 
 
-def category_validation_questions(module_key: str) -> list[str]:
-    keyed = LIMITED_EVIDENCE_COPY.get(module_key, {}).get("validation_questions")
-    if isinstance(keyed, list) and len(keyed) >= 2:
-        return keyed
-    return [
-        "What supporting schedules or department-level detail would confirm this diagnosis?",
-        "Which operating metrics should be validated before acting on these recommendations?",
-    ]
-
-
 def build_limited_evidence_module(
     *,
     module_key: str,
@@ -449,29 +558,21 @@ def build_limited_evidence_module(
     sources: list[SourceEvidence],
 ) -> InsightModuleOutput:
     max_sources = max(len(sources), 1)
-    category_copy = LIMITED_EVIDENCE_COPY.get(module_key, LIMITED_EVIDENCE_COPY["losses"])
-    direct_text = category_copy["direct_answer"]
-    findings_text = category_copy["key_findings"]
-    actions_text = category_copy["recommended_actions"]
+    category_copy = _category_copy(module_key)
     validation_questions = category_validation_questions(module_key)
 
-    direct_answer = parse_cited_field(direct_text, max_sources=max_sources, fallback_ids=[])
-    source_findings = build_source_supported_findings(sources) if sources else []
-    if len(source_findings) >= 2:
-        key_findings = source_findings[:3]
-    else:
-        category_findings = [
-            parse_cited_field(item, max_sources=max_sources, fallback_ids=[1] if sources else [])
-            for item in findings_text[:3]
-        ]
-        key_findings = source_findings + category_findings
-        key_findings = key_findings[:3]
-        if len(key_findings) < 2:
-            key_findings = category_findings[:3]
-
+    direct_answer = parse_cited_field(category_copy["direct_answer"], max_sources=max_sources, fallback_ids=[])
+    key_findings = [
+        parse_cited_field(
+            item,
+            max_sources=max_sources,
+            fallback_ids=_citation_id_for_index(sources, index) if sources else [],
+        )
+        for index, item in enumerate(category_copy["key_findings"][:3])
+    ]
     recommended_actions = [
         parse_cited_field(item, max_sources=max_sources, fallback_ids=[])
-        for item in actions_text[:3]
+        for item in category_copy["recommended_actions"][:3]
     ]
 
     message = (
@@ -499,6 +600,75 @@ def build_limited_evidence_module(
     )
 
 
+def build_partial_module_completion(
+    *,
+    module_key: str,
+    module_id: str,
+    title: str,
+    sources: list[SourceEvidence],
+    direct_answer: CitedField,
+    key_findings: list[CitedField],
+    recommended_actions: list[CitedField],
+) -> InsightModuleOutput:
+    max_sources = len(sources)
+    category_copy = _category_copy(module_key)
+
+    final_direct = direct_answer if cited_field_is_usable(direct_answer) else parse_cited_field(
+        category_copy["direct_answer"],
+        max_sources=max_sources,
+        fallback_ids=_citation_id_for_index(sources, 0),
+    )
+    if not cited_field_is_usable(final_direct):
+        final_direct = parse_cited_field(
+            category_copy["direct_answer"],
+            max_sources=max_sources,
+            fallback_ids=_citation_id_for_index(sources, 0),
+        )
+
+    final_findings = _supplement_cited_fields(
+        key_findings,
+        category_copy["key_findings"],
+        max_sources=max_sources,
+        sources=sources,
+        min_count=2,
+        max_count=4,
+        attach_citations=True,
+    )
+    final_actions = _supplement_cited_fields(
+        recommended_actions,
+        category_copy["recommended_actions"],
+        max_sources=max_sources,
+        sources=sources,
+        min_count=2,
+        max_count=4,
+        attach_citations=False,
+        reject_generic=True,
+    )
+
+    fully_valid = (
+        cited_field_is_usable(direct_answer)
+        and len([field for field in key_findings if cited_field_is_usable(field)]) >= 2
+        and len([field for field in recommended_actions if cited_field_is_usable(field)]) >= 2
+    )
+    confidence: InsightConfidence = "high" if max_sources >= 3 and fully_valid else "medium"
+
+    return InsightModuleOutput(
+        module_key=module_key,
+        module_id=module_id,
+        title=title,
+        status="ready",
+        confidence=confidence,
+        summary=final_direct,
+        direct_answer=final_direct,
+        key_findings=final_findings,
+        recommended_actions=final_actions,
+        evidence_limitations=EvidenceLimitations(message=None, validation_questions=[]),
+        validation_questions=[],
+        sources=sources,
+        metrics=[],
+    )
+
+
 def parse_generated_module(
     generated: dict[str, Any] | None,
     *,
@@ -520,19 +690,14 @@ def parse_generated_module(
         if item is not None
     ]
 
-    key_findings = [
-        item for item in key_findings
-        if text_is_substantive(item.text) and not text_has_internal_artifact(item.text)
-    ]
-    recommended_actions = [
-        item for item in recommended_actions
-        if text_is_substantive(item.text) and not text_is_generic_placeholder(item.text) and not text_has_internal_artifact(item.text)
-    ]
-
     return {
         "direct_answer": direct_answer,
-        "key_findings": key_findings,
-        "recommended_actions": recommended_actions,
+        "key_findings": [item for item in key_findings if cited_field_is_usable(item)],
+        "recommended_actions": [
+            item
+            for item in recommended_actions
+            if cited_field_is_usable(item) and not text_is_generic_placeholder(item.text)
+        ],
     }
 
 
@@ -546,94 +711,107 @@ def finalize_insight_module(
 ) -> tuple[InsightModuleOutput, list[str]]:
     sources = build_public_sources(source_packets)
     max_sources = len(sources)
+    usable_sources = count_usable_sources(sources)
     default_ids = [sources[0].citation_id] if sources else []
+    reasons: list[str] = []
 
-    if not sources or generated is None:
+    if usable_sources == 0:
         return (
             build_limited_evidence_module(
                 module_key=module_key,
                 module_id=module_id,
                 title=title,
-                sources=sources,
+                sources=[],
             ),
-            ["no_sources_or_generation"],
+            ["no_usable_sources"],
         )
 
-    parsed = parse_generated_module(generated, max_sources=max_sources, default_ids=default_ids)
-    if not parsed:
-        return (
-            build_limited_evidence_module(
+    parsed = parse_generated_module(generated, max_sources=max_sources, default_ids=default_ids) if generated else None
+
+    if usable_sources >= 2:
+        if not parsed:
+            reasons.append("parse_failed")
+            module = build_partial_module_completion(
                 module_key=module_key,
                 module_id=module_id,
                 title=title,
                 sources=sources,
-            ),
-            ["parse_failed"],
-        )
+                direct_answer=parse_cited_field("", max_sources=max_sources),
+                key_findings=[],
+                recommended_actions=[],
+            )
+            return module, reasons
 
-    direct_answer: CitedField = parsed["direct_answer"]
-    key_findings: list[CitedField] = parsed["key_findings"]
-    recommended_actions: list[CitedField] = parsed["recommended_actions"]
-
-    if not text_is_substantive(direct_answer.text) or text_has_internal_artifact(direct_answer.text):
-        return (
-            build_limited_evidence_module(
-                module_key=module_key,
-                module_id=module_id,
-                title=title,
-                sources=sources,
-            ),
-            ["direct_answer_not_usable"],
-        )
-
-    if len(key_findings) < 2 or len(recommended_actions) < 2:
-        return (
-            build_limited_evidence_module(
-                module_key=module_key,
-                module_id=module_id,
-                title=title,
-                sources=sources,
-            ),
-            ["insufficient_findings_or_actions"],
-        )
-
-    confidence: InsightConfidence = "high" if max_sources >= 2 else "medium"
-    module = InsightModuleOutput(
-        module_key=module_key,
-        module_id=module_id,
-        title=title,
-        status="ready",
-        confidence=confidence,
-        summary=direct_answer,
-        direct_answer=direct_answer,
-        key_findings=key_findings[:4],
-        recommended_actions=recommended_actions[:4],
-        evidence_limitations=EvidenceLimitations(message=None, validation_questions=[]),
-        validation_questions=[],
-        sources=sources,
-        metrics=[],
-    )
-
-    ok, reasons = validate_module_output(module)
-    if ok:
-        return module, []
-
-    return (
-        build_limited_evidence_module(
+        module = build_partial_module_completion(
             module_key=module_key,
             module_id=module_id,
             title=title,
             sources=sources,
-        ),
-        reasons,
+            direct_answer=parsed["direct_answer"],
+            key_findings=parsed["key_findings"],
+            recommended_actions=parsed["recommended_actions"],
+        )
+        if len(parsed["key_findings"]) < 2:
+            reasons.append("key_findings_supplemented")
+        if len(parsed["recommended_actions"]) < 2:
+            reasons.append("recommended_actions_supplemented")
+        if not cited_field_is_usable(parsed["direct_answer"]):
+            reasons.append("direct_answer_supplemented")
+        return module, reasons
+
+    # Single usable source: limited_evidence unless generation is fully usable.
+    if not parsed or not cited_field_is_usable(parsed["direct_answer"]):
+        return (
+            build_limited_evidence_module(
+                module_key=module_key,
+                module_id=module_id,
+                title=title,
+                sources=sources,
+            ),
+            ["single_source_insufficient_generation"],
+        )
+
+    module = build_partial_module_completion(
+        module_key=module_key,
+        module_id=module_id,
+        title=title,
+        sources=sources,
+        direct_answer=parsed["direct_answer"],
+        key_findings=parsed["key_findings"],
+        recommended_actions=parsed["recommended_actions"],
     )
+    module = module.model_copy(update={"confidence": "low"})
+    if len(parsed["key_findings"]) < 2 or len(parsed["recommended_actions"]) < 2:
+        return (
+            build_limited_evidence_module(
+                module_key=module_key,
+                module_id=module_id,
+                title=title,
+                sources=sources,
+            ),
+            ["single_source_partial_generation"],
+        )
+    return module, ["single_source_ready"]
 
 
 def serialize_module_for_api(module: InsightModuleOutput) -> dict[str, Any]:
     """Final backend validator immediately before API serialization."""
     module = normalize_module_cited_fields(module)
-    ok, _ = validate_module_output(module)
-    if not ok or module_has_visible_artifacts(module):
+    ok, reasons = validate_module_output(module)
+    usable_sources = count_usable_sources(module.sources)
+
+    if (not ok or module_has_visible_artifacts(module)) and usable_sources >= 2:
+        module = build_partial_module_completion(
+            module_key=module.module_key,
+            module_id=module.module_id,
+            title=module.title,
+            sources=module.sources,
+            direct_answer=module.direct_answer,
+            key_findings=module.key_findings,
+            recommended_actions=module.recommended_actions,
+        )
+        module = normalize_module_cited_fields(module)
+    elif not ok or module_has_visible_artifacts(module):
         module = build_limited_evidence_module(
             module_key=module.module_key,
             module_id=module.module_id,
