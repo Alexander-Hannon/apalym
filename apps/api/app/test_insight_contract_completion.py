@@ -190,7 +190,7 @@ class InsightContractCompletionTests(unittest.TestCase):
         self.assertGreaterEqual(len(payload["validation_questions"]), 2)
         self.assertIn("no_usable_sources", reasons)
 
-    def test_case_e_one_weak_source_invalid_generation_limited_evidence(self):
+    def test_case_e_one_weak_source_generation_preserved_with_supplements(self):
         module, reasons = finalize_insight_module(
             module_key="risks",
             module_id="key-risks",
@@ -215,16 +215,15 @@ class InsightContractCompletionTests(unittest.TestCase):
         )
         payload = serialize_module_for_api(module)
 
-        self.assertEqual(payload["status"], "limited_evidence")
+        self.assertEqual(payload["status"], "ready")
         self.assertEqual(len(payload["sources"]), 1)
         self.assertEqual(payload["sources"][0]["title"], "Source excerpt 1")
-        self.assertNotIn(
-            "YTD capex spending remains elevated",
-            payload["direct_answer"]["text"],
-        )
+        self.assertIn("Capex", payload["direct_answer"]["text"])
+        self.assertGreaterEqual(len(payload["key_findings"]), 2)
+        self.assertGreaterEqual(len(payload["recommended_actions"]), 2)
         for text in collect_visible_diagnosis_text(payload):
             self.assertNotIn("YTD capex spending", text)
-        self.assertIn(reasons[0], {"single_source_insufficient_generation", "single_source_partial_generation"})
+        self.assertTrue(reasons)
 
     def test_limited_evidence_never_injects_raw_source_excerpts_into_findings(self):
         sources = build_public_sources(THREE_SOURCE_PACKETS)

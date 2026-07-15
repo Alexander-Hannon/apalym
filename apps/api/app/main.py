@@ -3100,7 +3100,17 @@ def generate_insights(req: InsightsRequest, request: Request):
             source_packets=source_packets,
         )
 
-        finalized = serialize_module_for_api(module_output)
+        finalized = serialize_module_for_api(
+            module_output,
+            log_context={
+                "retrieved_chunk_count": len(matches),
+                "request_id": request_id,
+                "tenant_id": tenant_id,
+                "doc_id": doc_id,
+                "module_id": module_id,
+                "service": "api",
+            },
+        )
         if finalized.get("status") == "limited_evidence":
             modules_using_fallback.append(module_id)
         if failure_reasons:
